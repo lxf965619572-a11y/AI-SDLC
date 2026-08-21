@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>多智能体软件开发流水线</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<script src="{{ url_for('static', filename='libs/marked.min.js') }}"></script>
+<script src="{{ url_for('static', filename='libs/mermaid.min.js') }}"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-icon">⚙️</span>
+    <span class="brand-title">多智能体软件开发流水线</span>
+  </div>
+  <div class="mock-badge" id="mockBadge" style="display:none">离线演示模式</div>
+</header>
+
+<div class="layout">
+  <!-- 左侧：项目列表 -->
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <h3>项目</h3>
+      <button class="btn btn-primary btn-sm" id="btnNewProject">+ 新建</button>
+    </div>
+    <div id="projectList" class="project-list"></div>
+  </aside>
+
+  <!-- 右侧：详情 -->
+  <main class="main">
+    <div id="emptyState" class="empty-state">
+      <div class="empty-icon">📋</div>
+      <p>选择或新建一个项目，上传 PRD / Word / PDF 需求文档开始</p>
+    </div>
+
+    <div id="detail" style="display:none">
+      <!-- 项目头 -->
+      <div class="detail-head">
+        <h2 id="projName"></h2>
+        <div class="status-pill" id="projStatus"></div>
+      </div>
+
+      <!-- 上传区（紧凑，可折叠） -->
+      <div class="card compact collapsed" id="uploadCard">
+        <div class="card-title">需求文档</div>
+        <div class="collapse-body">
+          <div id="docList" class="doc-list"></div>
+          <div class="upload-row">
+            <input type="file" id="fileInput" accept=".docx,.pdf,.md,.txt" multiple>
+            <button class="btn btn-primary" id="btnUpload">上传</button>
+            <button class="btn btn-success" id="btnStart">▶ 启动流水线</button>
+            <button class="btn btn-warning" id="btnResume" style="display:none" title="从最后成功的阶段继续，不重跑已完成部分">⤵ 断点续跑</button>
+            <button class="btn btn-danger-outline" id="btnReset" title="清空已有产物与进度，重新跑">↺ 重置重跑</button>
+            <button class="btn" id="btnCancel" style="display:none">⏹ 取消运行</button>
+          </div>
+          <div class="hint">支持 .docx / .pdf / .md / .txt</div>
+        </div>
+      </div>
+
+      <!-- 阶段进度（紧凑，可折叠） -->
+      <div class="card compact" id="stageCard">
+        <div class="card-title">阶段进度</div>
+        <div class="collapse-body">
+          <div class="stage-track" id="stageTrack"></div>
+        </div>
+      </div>
+
+      <!-- 产物与评审 -->
+      <div class="card" id="artifactCard" style="display:none">
+        <div class="card-title artifact-head">
+          <span id="artifactTitle"></span>
+          <span class="version-tag" id="artifactVersion"></span>
+          <span class="theme-switch" title="图表风格切换（可随时切换）">
+            <button class="btn btn-sm theme-opt" id="btnThemeClassic">经典</button><button class="btn btn-sm theme-opt" id="btnThemeTech">科技感</button>
+          </span>
+          <span class="export-btns">
+            <button class="btn btn-sm btn-outline" id="btnExportDocx" title="导出为 Word 文档">导出 Word</button>
+            <button class="btn btn-sm btn-outline" id="btnExportMd" title="导出为 Markdown 原文">导出 Markdown</button>
+          </span>
+        </div>
+        <div class="pin-bar" id="pinBar" style="display:none">
+          <span class="pin-hint" id="pinHint"></span>
+          <button class="btn btn-sm btn-outline" id="btnReloadPinned" style="display:none"></button>
+          <button class="btn btn-sm btn-outline" id="btnReleasePin">跟随当前进度</button>
+        </div>
+        <div class="artifact-body markdown-body" id="artifactBody"></div>
+        <div class="review-panel" id="reviewPanel">
+          <textarea id="reviewComments" placeholder="评审意见（驳回时必填）"></textarea>
+          <div class="review-actions">
+            <button class="btn btn-success" id="btnApprove">✓ 通过，进入下一阶段</button>
+            <button class="btn btn-danger" id="btnReject">✗ 驳回，返回修改</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 导出 -->
+      <div class="card" id="exportCard" style="display:none">
+        <div class="card-title">测试用例导出</div>
+        <div class="export-row">
+          <button class="btn btn-primary" onclick="exportCases('excel')">导出 Excel</button>
+          <button class="btn btn-primary" onclick="exportCases('xmind')">导出 XMind</button>
+        </div>
+      </div>
+
+      <!-- 日志 -->
+      <div class="card">
+        <div class="card-title">执行日志</div>
+        <div class="log-box" id="logBox"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- 图表放大查看浮层 -->
+<div class="diagram-zoom-overlay" id="diagramZoomOverlay" style="display:none">
+  <div class="dz-toolbar">
+    <span class="dz-title" id="dzTitle">图表预览</span>
+    <span class="dz-spacer"></span>
+    <button class="btn btn-sm" id="dzZoomOut" title="缩小">−</button>
+    <span class="dz-scale" id="dzScale">100%</span>
+    <button class="btn btn-sm" id="dzZoomIn" title="放大">＋</button>
+    <button class="btn btn-sm" id="dzFit" title="适应窗口">适应</button>
+    <button class="btn btn-sm" id="dzReset" title="原始大小">1:1</button>
+    <button class="btn btn-sm btn-danger-outline" id="dzClose" title="关闭（Esc）">✕ 关闭</button>
+  </div>
+  <div class="dz-viewport" id="dzViewport">
+    <div class="dz-holder" id="dzHolder"></div>
+  </div>
+  <div class="dz-hint">滚轮缩放 · 拖动平移 · 双击适应窗口</div>
+</div>
+
+<!-- 新建项目弹窗 -->
+<div class="modal" id="newProjectModal" style="display:none">
+  <div class="modal-box">
+    <h3>新建项目</h3>
+    <input type="text" id="newProjectName" placeholder="项目名称">
+    <div class="modal-actions">
+      <button class="btn" id="btnCancelNew">取消</button>
+      <button class="btn btn-primary" id="btnConfirmNew">创建</button>
+    </div>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

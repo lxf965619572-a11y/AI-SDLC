@@ -1,0 +1,753 @@
+/* 多智能体软件开发流水线 - 前端逻辑 */
+
+const STAGES = ["parse", "requirement", "hld", "lld", "testcase"];
+const STAGE_NAMES = {
+  parse: "结构化原始数据",
+  requirement: "软件需求规格说明书",
+  hld: "概要设计说明书",
+  lld: "详细设计说明书",
+  testcase: "测试用例设计",
+};
+const STATUS_TEXT = {
+  created: "待启动", parsing: "解析中", running: "执行中",
+  waiting_review: "等待评审", completed: "已完成", failed: "已失败",
+};
+
+let currentProjectId = null;
+let pollTimer = null;
+let currentArtifactStage = null;
+let pinnedStage = null;        // 用户手动查看的阶段（pin 期间轮询不自动切换）
+let pinnedVersion = null;      // pin 时查看的版本号（同阶段出新版时提示）
+
+/* ---------- 图表主题：科技感（暗色+动效） / 经典（白底静态，适合插入文档） ---------- */
+
+const TECH_INIT = {
+  startOnLoad: false,
+  theme: "base",
+  securityLevel: "loose",
+  flowchart: { curve: "basis", nodeSpacing: 50, rankSpacing: 60, htmlLabels: true },
+  sequence: { mirrorActors: false },
+  themeVariables: {
+    /* 科技感暗色主题 */
+    darkMode: true,
+    background: "#0b1220",
+    primaryColor: "#0f2540",
+    primaryTextColor: "#dbeafe",
+    primaryBorderColor: "#38bdf8",
+    lineColor: "#67e8f9",
+    secondaryColor: "#132c4d",
+    tertiaryColor: "#0d1b2e",
+    fontFamily: '"Segoe UI", "Microsoft YaHei", system-ui, sans-serif',
+    fontSize: "13px",
+    edgeLabelBackground: "#0b1220",
+    clusterBkg: "#0d1b33",
+    clusterBorder: "#1e3a5f",
+    titleColor: "#e0f2fe",
+    actorBkg: "#0f2540", actorBorder: "#38bdf8", actorTextColor: "#dbeafe",
+    actorLineColor: "#334155",
+    signalColor: "#67e8f9", signalTextColor: "#dbeafe",
+    noteBkgColor: "#1e3a5f", noteTextColor: "#bae6fd", noteBorderColor: "#38bdf8",
+    classText: "#dbeafe",
+    fillType0: "#0f2540", fillType1: "#132c4d", fillType2: "#0d1b2e",
+  },
+};
+
+const CLASSIC_INIT = {
+  startOnLoad: false,
+  theme: "default",   /* mermaid 官方浅色主题，白底黑字，适合导出/插入文档 */
+  securityLevel: "loose",
+  flowchart: { curve: "basis", nodeSpacing: 50, rankSpacing: 60, htmlLabels: true },
+  sequence: { mirrorActors: false },
+  themeVariables: {
+    fontFamily: '"Segoe UI", "Microsoft YaHei", system-ui, sans-serif',
+    fontSize: "13px",
+  },
+};
+
+let diagramTheme = "tech";
+try { diagramTheme = localStorage.getItem("diagramTheme") === "classic" ? "classic" : "tech"; } catch (e) {}
+const REDUCE_MOTION = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function applyMermaidInit() {
+  /* 重新 initialize 会向 head 追加新主题的样式表，位置靠后 → 同优先级下覆盖旧主题残留 */
+  mermaid.initialize(diagramTheme === "tech" ? TECH_INIT : CLASSIC_INIT);
+}
+applyMermaidInit();
+
+/* 连线光晕色 = 科技感容器背景色，让交叉/贴边的线视觉分离 */
+const HALO_COLOR = "#0b1220";
+
+function updateDiagramThemeUI() {
+  const bc = document.getElementById("btnThemeClassic");
+  const bt = document.getElementById("btnThemeTech");
+  if (bc) bc.classList.toggle("active", diagramTheme === "classic");
+  if (bt) bt.classList.toggle("active", diagramTheme === "tech");
+}
+
+function renderMarkdown(md) {
+  const body = document.getElementById("artifactBody");
+  body.innerHTML = marked.parse(md || "");
+  // 将 ```mermaid 代码块转为 mermaid 容器；dataset.src 保存源码供主题切换时重渲染
+  body.querySelectorAll("pre code.language-mermaid, pre code[class*=language-mermaid]").forEach(code => {
+    const div = document.createElement("div");
+    div.className = "mermaid" + (diagramTheme === "classic" ? " mermaid-classic" : "");
+    div.dataset.src = code.textContent;
+    div.textContent = code.textContent;
+    code.closest("pre").replaceWith(div);
+  });
+  runDiagrams(Array.from(body.querySelectorAll(".mermaid")));
+}
+
+/* 渲染一批 mermaid 容器；仅科技感主题做增强。
+   注意：mermaid.run 在同一页面二次调用时会复用上一次的临时元素导致图形混杂，
+   因此改用 mermaid.render + 全局唯一 id 自行写入 svg。 */
+let renderSeq = 0;
+async function runDiagrams(nodes) {
+  if (!nodes || !nodes.length) return;
+  for (const c of nodes) {
+    const src = c.dataset.src || c.textContent;
+    const id = "wbm-" + Date.now().toString(36) + "-" + (++renderSeq);
+    try {
+      const { svg } = await mermaid.render(id, src);
+      c.innerHTML = svg;
+    } catch (e) {
+      console.warn("mermaid:", e);
+      window.__diagErr = (window.__diagErr || "") + "mermaid.render:" + e.message + "; ";
+      const tmp = document.getElementById(id);
+      if (tmp) tmp.remove();
+      c.innerHTML = `<pre style="text-align:left;color:#b91c1c">图表渲染失败：${e.message}</pre>`;
+      continue;
+    }
+    // svg 已写入；科技感主题立即增强（轮询兜底以防异步时序）
+    if (diagramTheme === "tech") enhanceWhenReady(c);
+    attachZoomButton(c);
+  }
+}
+
+/* 图表容器右上角挂"放大"按钮，点击进入全屏查看（可缩放/平移） */
+function attachZoomButton(container) {
+  if (container.querySelector(".zoom-btn")) return;
+  const btn = document.createElement("button");
+  btn.className = "zoom-btn";
+  btn.textContent = "⤢ 放大";
+  btn.title = "放大查看（可缩放、拖动）";
+  btn.onclick = e => { e.stopPropagation(); openDiagramZoom(container); };
+  container.appendChild(btn);
+}
+
+/* ---------- 图表全屏放大查看 ---------- */
+const dzState = { scale: 1, tx: 0, ty: 0 };
+
+function dzApply() {
+  const holder = document.getElementById("dzHolder");
+  holder.style.transform = `translate(calc(-50% + ${dzState.tx}px), calc(-50% + ${dzState.ty}px)) scale(${dzState.scale})`;
+  document.getElementById("dzScale").textContent = Math.round(dzState.scale * 100) + "%";
+}
+
+/* 让图表以 90% 视口尺寸完整显示（fit） */
+function dzFit() {
+  const holder = document.getElementById("dzHolder");
+  const vp = document.getElementById("dzViewport");
+  const svg = holder.querySelector("svg");
+  if (!svg) return;
+  const sw = svg.getBoundingClientRect().width / dzState.scale;
+  const sh = svg.getBoundingClientRect().height / dzState.scale;
+  const fit = Math.min((vp.clientWidth * 0.92) / sw, (vp.clientHeight * 0.9) / sh);
+  dzState.scale = Math.max(0.05, Math.min(fit, 8));
+  dzState.tx = 0; dzState.ty = 0;
+  dzApply();
+}
+
+function openDiagramZoom(container) {
+  const svg = container.querySelector("svg");
+  if (!svg) { toast("图表尚未渲染完成", true); return; }
+  const overlay = document.getElementById("diagramZoomOverlay");
+  const holder = document.getElementById("dzHolder");
+  holder.innerHTML = "";
+  // 克隆 svg（保留内联样式/滤镜），并给浮层里的 svg 解除 max-width 限制
+  const clone = svg.cloneNode(true);
+  clone.style.maxWidth = "none";
+  clone.style.background = "transparent";
+  holder.appendChild(clone);
+  // 标题：取容器前最近的标题文本
+  let title = "图表预览";
+  let prev = container.previousElementSibling;
+  while (prev) {
+    if (/^H[1-6]$/.test(prev.tagName)) { title = prev.textContent; break; }
+    prev = prev.previousElementSibling;
+  }
+  document.getElementById("dzTitle").textContent = title;
+  overlay.style.display = "flex";
+  dzState.scale = 1; dzState.tx = 0; dzState.ty = 0;
+  dzFit();
+}
+
+function closeDiagramZoom() {
+  document.getElementById("diagramZoomOverlay").style.display = "none";
+  document.getElementById("dzHolder").innerHTML = "";
+}
+
+(function initDiagramZoom() {
+  const overlay = document.getElementById("diagramZoomOverlay");
+  const vp = document.getElementById("dzViewport");
+  document.getElementById("dzClose").onclick = closeDiagramZoom;
+  document.getElementById("dzFit").onclick = dzFit;
+  document.getElementById("dzReset").onclick = () => { dzState.scale = 1; dzState.tx = 0; dzState.ty = 0; dzApply(); };
+  document.getElementById("dzZoomIn").onclick = () => { dzState.scale = Math.min(8, dzState.scale * 1.25); dzApply(); };
+  document.getElementById("dzZoomOut").onclick = () => { dzState.scale = Math.max(0.05, dzState.scale / 1.25); dzApply(); };
+  overlay.addEventListener("click", e => { if (e.target === overlay) closeDiagramZoom(); });
+  document.addEventListener("keydown", e => {
+    if (overlay.style.display !== "none" && overlay.style.display !== "") {
+      if (e.key === "Escape") closeDiagramZoom();
+      if (e.key === "+") { dzState.scale = Math.min(8, dzState.scale * 1.25); dzApply(); }
+      if (e.key === "-") { dzState.scale = Math.max(0.05, dzState.scale / 1.25); dzApply(); }
+    }
+  });
+  // 滚轮缩放
+  vp.addEventListener("wheel", e => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+    dzState.scale = Math.max(0.05, Math.min(8, dzState.scale * factor));
+    dzApply();
+  }, { passive: false });
+  // 拖动平移
+  let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
+  vp.addEventListener("mousedown", e => {
+    dragging = true; vp.classList.add("dragging");
+    sx = e.clientX; sy = e.clientY; ox = dzState.tx; oy = dzState.ty;
+  });
+  window.addEventListener("mousemove", e => {
+    if (!dragging) return;
+    dzState.tx = ox + (e.clientX - sx);
+    dzState.ty = oy + (e.clientY - sy);
+    dzApply();
+  });
+  window.addEventListener("mouseup", () => { dragging = false; vp.classList.remove("dragging"); });
+  vp.addEventListener("dblclick", dzFit);
+})();
+
+/* 主题切换：记忆偏好 → 重新 initialize → 用保存的源码重渲染页面内所有图表 */
+function setDiagramTheme(theme) {
+  if (theme !== "classic" && theme !== "tech") return;
+  if (theme === diagramTheme) { updateDiagramThemeUI(); return; }
+  diagramTheme = theme;
+  try { localStorage.setItem("diagramTheme", theme); } catch (e) {}
+  applyMermaidInit();
+  updateDiagramThemeUI();
+  const nodes = [];
+  document.querySelectorAll(".mermaid").forEach(c => {
+    const src = c.dataset.src;
+    if (!src) return;
+    /* 换新容器元素重渲染，避免复用旧容器时 mermaid 内部状态错乱 */
+    const fresh = document.createElement("div");
+    fresh.className = "mermaid" + (diagramTheme === "classic" ? " mermaid-classic" : "");
+    fresh.dataset.src = src;
+    fresh.textContent = src;
+    c.replaceWith(fresh);
+    nodes.push(fresh);
+  });
+  runDiagrams(nodes);
+}
+
+/* 轮询等待容器内出现渲染好的 svg 后执行科技感增强 */
+function enhanceWhenReady(container) {
+  const start = Date.now();
+  const timer = setInterval(() => {
+    if (container.querySelector("svg")) {
+      clearInterval(timer);
+      try {
+        enhanceTechDiagram(container);
+        container.dataset.enhanced = "1";
+      } catch (e) {
+        console.warn("diagram enhance failed:", e);
+        window.__diagErr = (window.__diagErr || "") + "enhance:" + e.message + "; ";
+      }
+    } else if (Date.now() - start > 15000) {
+      clearInterval(timer);
+    }
+  }, 200);
+}
+
+/* 科技感增强：连线光晕（避免与元素/其他线视觉重合）+ 流动虚线（数据流向动画）
+   注意：mermaid 会向页面注入样式类（edge-pattern-solid / edge-thickness-normal），
+   覆盖 class 级 CSS，因此这里一律使用内联样式。 */
+function enhanceTechDiagram(container) {
+  const svg = container.querySelector("svg");
+  if (!svg) return;
+
+  // 1) 连线光晕：在每条连线下方垫一条背景色宽描边，
+  //    线与元素贴边、线与线交叉时都能清晰分离
+  const edgeSel = ".flowchart-link, path.path, .messageLine0, .messageLine1, .relation";
+  svg.querySelectorAll(edgeSel).forEach(p => {
+    if (p.classList.contains("flow-halo") || p.closest("marker")) return;
+    const halo = p.cloneNode(false);
+    halo.classList.add("flow-halo");
+    /* 内联样式优先级高于 mermaid 注入的类样式 */
+    halo.style.stroke = HALO_COLOR;
+    halo.style.strokeWidth = "7";
+    halo.style.fill = "none";
+    halo.removeAttribute("marker-start");
+    halo.removeAttribute("marker-end");
+    halo.removeAttribute("filter");
+    p.parentNode.insertBefore(halo, p);
+  });
+
+  // 2) 流动虚线动画：数据流向可视化（错峰启动，方向感更强）
+  //    语义保护：
+  //    - 序列图（含 .messageLine0）：整体保持静态，不做流动动画（用户要求）。
+  //    - 类图（含 .relation）：实线关系（edge-pattern-solid）保持静态；
+  //      仅虚线关系（edge-pattern-dashed，本来就是虚线）做流动动画。
+  const isClass = !!svg.querySelector("path.relation");
+  const isSeq = !!svg.querySelector(".messageLine0");
+  let i = 0;
+  if (!isSeq) {
+    svg.querySelectorAll(edgeSel).forEach(p => {
+      if (p.classList.contains("flow-halo")) return;
+      if (isClass && p.classList.contains("edge-pattern-solid")) return;  // 实线关系保持静态
+      p.classList.add("flow-dash");
+      p.style.strokeDasharray = "7 5";
+      if (!REDUCE_MOTION) {
+        p.style.animation = "flowDashMove 1.1s linear infinite";
+        p.style.animationDelay = `${(i % 7) * 0.22}s`;
+      }
+      i++;
+    });
+  }
+
+  // 3) 发光滤镜：节点与连线描边带霓虹光感
+  let defs = svg.querySelector("defs");
+  if (!defs) { defs = document.createElementNS("http://www.w3.org/2000/svg", "defs"); svg.insertBefore(defs, svg.firstChild); }
+  if (!defs.querySelector("#techGlow")) {
+    defs.insertAdjacentHTML("beforeend",
+      `<filter id="techGlow" x="-40%" y="-40%" width="180%" height="180%">
+         <feDropShadow dx="0" dy="0" stdDeviation="2.2" flood-color="#38bdf8" flood-opacity="0.55"/>
+       </filter>
+       <filter id="techGlowSoft" x="-40%" y="-40%" width="180%" height="180%">
+         <feDropShadow dx="0" dy="0" stdDeviation="1.4" flood-color="#67e8f9" flood-opacity="0.5"/>
+       </filter>`);
+  }
+  svg.querySelectorAll(".flowchart-link, path.path, .messageLine0, .messageLine1, .relation")
+    .forEach(p => {
+      if (p.classList.contains("flow-halo")) return;
+      // 关键：直线段（垂直线 bbox 宽=0 / 水平线 bbox 高=0）套用 feDropShadow 百分比滤镜时
+      // 滤镜区域会退化为零，整条线连同箭头被裁剪消失。这类线跳过发光，保持原样。
+      try {
+        const bb = p.getBBox();
+        if (bb.width < 1 || bb.height < 1) return;
+      } catch (e) { return; }
+      p.setAttribute("filter", "url(#techGlowSoft)");
+    });
+  svg.querySelectorAll(".node .label-container, .node rect, .node polygon, .node circle, .node ellipse, .actor, .classGroup rect, .note")
+    .forEach(el => { if (!el.getAttribute("filter")) el.setAttribute("filter", "url(#techGlow)"); });
+
+  // 4) 箭头同色发光
+  //    UML 类图 & 序列图跳过：类图箭头含空心三角形（继承/实现，fill=none 靠描边显形），
+  //    序列图含开放箭头（回复），统一改填充会破坏箭头语义；保持 mermaid 原始箭头形状与颜色。
+  if (!svg.querySelector("path.relation") && !svg.querySelector(".messageLine0")) {
+    svg.querySelectorAll("marker path").forEach(mp => {
+      mp.setAttribute("stroke", "none");
+      const fill = mp.getAttribute("fill") || "";
+      if (!fill || fill === "none" || fill === "transparent") mp.setAttribute("fill", "#67e8f9");
+    });
+  }
+}
+async function api(path, options = {}) {
+  const resp = await fetch(path, options);
+  if (!resp.ok) {
+    let msg = `HTTP ${resp.status}`;
+    try { msg = (await resp.json()).error || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  return resp.json();
+}
+
+function toast(msg, isError = false) {
+  const el = document.createElement("div");
+  el.style.cssText = `position:fixed;top:20px;right:20px;z-index:999;padding:12px 20px;
+    border-radius:8px;color:#fff;font-size:14px;box-shadow:0 4px 12px rgba(0,0,0,.2);
+    background:${isError ? "#dc2626" : "#16a34a"};`;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+/* ---------- 项目列表 ---------- */
+async function loadProjects() {
+  const projects = await api("/api/projects");
+  const list = document.getElementById("projectList");
+  list.innerHTML = "";
+  projects.forEach(p => {
+    const div = document.createElement("div");
+    div.className = "project-item" + (p.id === currentProjectId ? " active" : "");
+    div.innerHTML = `<div class="pi-name">${escapeHtml(p.name)}</div>
+      <div class="pi-meta">
+        <span class="status-pill st-${p.status}" style="padding:1px 8px;font-size:11px">${STATUS_TEXT[p.status] || p.status}</span>
+        <span>${p.created_at}</span>
+      </div>`;
+    div.onclick = () => selectProject(p.id);
+    list.appendChild(div);
+  });
+  return projects;
+}
+
+function selectProject(pid) {
+  currentProjectId = pid;
+  releasePin();  // 切换项目时释放查看锁定
+  currentArtifactStage = null;
+  document.getElementById("emptyState").style.display = "none";
+  document.getElementById("detail").style.display = "block";
+  loadProjects();
+  refreshDetail();
+  startPolling();
+}
+
+/* ---------- 轮询 ---------- */
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(refreshDetail, 2500);
+}
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+/* ---------- 详情刷新 ---------- */
+async function refreshDetail() {
+  if (!currentProjectId) return;
+  try {
+    const st = await api(`/api/projects/${currentProjectId}/status`);
+    renderHeader(st);
+    renderDocs(st.documents);
+    renderStageTrack(st);
+    renderExport(st);
+    renderLogs();
+    // 用户手动查看（pin）期间：保持显示 pin 的阶段，绝不自动切换
+    if (pinnedStage) {
+      if (currentArtifactStage !== pinnedStage) await loadArtifact(pinnedStage);
+      await checkPinnedVersion(st);
+      return;
+    }
+    // 等待评审时自动加载当前阶段产物
+    if (st.status === "waiting_review" && st.current_stage) {
+      if (currentArtifactStage !== st.current_stage) {
+        await loadArtifact(st.current_stage);
+      }
+    } else if (st.status !== "waiting_review") {
+      // 非评审状态：若已展示过产物则隐藏评审面板按钮
+      if (currentArtifactStage && document.getElementById("artifactCard").style.display !== "none") {
+        document.getElementById("reviewPanel").style.display = "none";
+      }
+    }
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function renderHeader(st) {
+  document.getElementById("projName").textContent = st.name;
+  const pill = document.getElementById("projStatus");
+  pill.textContent = STATUS_TEXT[st.status] || st.status;
+  pill.className = "status-pill st-" + st.status;
+  if (st.error) pill.title = st.error;
+  // 运行中（含解析中）显示取消按钮
+  const running = st.status === "running" || st.status === "parsing";
+  document.getElementById("btnCancel").style.display = running ? "inline-block" : "none";
+  // 失败且存在可续跑检查点时显示断点续跑按钮
+  const resumable = st.status === "failed" && st.resumable;
+  document.getElementById("btnResume").style.display = resumable ? "inline-block" : "none";
+  // 待启动项目：自动展开上传区（折叠状态会挡住上传/启动入口）
+  if (st.status === "created") {
+    document.getElementById("uploadCard").classList.remove("collapsed");
+  }
+}
+
+function renderDocs(docs) {
+  const el = document.getElementById("docList");
+  if (!docs.length) { el.innerHTML = '<div class="hint">尚未上传文档</div>'; return; }
+  el.innerHTML = docs.map(d => `
+    <div class="doc-item">
+      <span>${d.status === "parsed" ? '<span class="ok">✔</span>' :
+        d.status === "failed" ? '<span class="err">✘</span>' : "📄"}</span>
+      <span>${escapeHtml(d.filename)}</span>
+      <span class="hint">${d.file_type}</span>
+      <button class="btn btn-sm" style="margin-left:auto;padding:2px 8px;font-size:12px"
+        onclick="deleteDoc(${d.id})">删除</button>
+    </div>`).join("");
+}
+
+async function deleteDoc(docId) {
+  if (!confirm("确定删除该文档？")) return;
+  try {
+    await api(`/api/projects/${currentProjectId}/documents/${docId}`, { method: "DELETE" });
+    toast("文档已删除");
+    refreshDetail();
+  } catch (e) {
+    toast("删除失败：" + e.message, true);
+  }
+}
+
+async function cancelPipeline() {
+  try {
+    await api(`/api/projects/${currentProjectId}/cancel`, { method: "POST" });
+    toast("取消请求已发送，流水线将在当前批次结束后停止");
+  } catch (e) {
+    toast("取消失败：" + e.message, true);
+  }
+}
+
+function renderStageTrack(st) {
+  const track = document.getElementById("stageTrack");
+  track.innerHTML = "";
+  STAGES.forEach((s, i) => {
+    if (i > 0) {
+      const line = document.createElement("div");
+      line.className = "stage-line";
+      if (st.artifacts[s] || stageIndex(st.current_stage) > i) line.className += " done";
+      track.appendChild(line);
+    }
+    const node = document.createElement("div");
+    node.className = "stage-node";
+    const art = st.artifacts[s];
+    let dotContent = i + 1;
+    if (st.status === "waiting_review" && st.current_stage === s) {
+      node.className += " waiting"; dotContent = "⏸";
+    } else if (art && art.status === "approved") {
+      node.className += " done"; dotContent = "✓";
+    } else if (art && art.status === "rejected") {
+      node.className += " rejected"; dotContent = "↻";
+    } else if ((st.status === "running" || st.status === "parsing") && st.current_stage === s) {
+      node.className += " active";
+    } else if (art) {
+      node.className += " active";
+    }
+    // 当前 pin 查看的阶段加高亮
+    if (pinnedStage === s) node.className += " pinned";
+    node.innerHTML = `<div class="stage-dot">${dotContent}</div>
+      <div class="stage-name">${STAGE_NAMES[s]}</div>`;
+    node.style.cursor = art ? "pointer" : "default";
+    if (art) node.onclick = () => loadArtifact(s);
+    track.appendChild(node);
+  });
+}
+
+function stageIndex(s) { return STAGES.indexOf(s); }
+
+function renderExport(st) {
+  const card = document.getElementById("exportCard");
+  const tc = st.artifacts["testcase"];
+  card.style.display = tc ? "block" : "none";
+}
+
+/* ---------- 产物渲染 ---------- */
+async function loadArtifact(stage) {
+  currentArtifactStage = stage;
+  try {
+    const art = await api(`/api/projects/${currentProjectId}/stages/${stage}/artifact`);
+    pinnedStage = stage;               // 打开产物即锁定，轮询不再自动切走
+    pinnedVersion = art.version;
+    const card = document.getElementById("artifactCard");
+    card.style.display = "block";
+    document.getElementById("artifactTitle").textContent = art.title;
+    document.getElementById("artifactVersion").textContent = `v${art.version}`;
+    document.getElementById("pinBar").style.display = "flex";
+    document.getElementById("pinHint").textContent =
+      `正在查看：${STAGE_NAMES[stage] || stage} v${art.version}（已锁定，轮询不会切换）`;
+    document.getElementById("btnReloadPinned").style.display = "none";
+    document.getElementById("btnExportDocx").onclick = () =>
+      window.open(`/api/projects/${currentProjectId}/stages/${stage}/export?format=docx`, "_blank");
+    document.getElementById("btnExportMd").onclick = () =>
+      window.open(`/api/projects/${currentProjectId}/stages/${stage}/export?format=md`, "_blank");
+    renderMarkdown(art.markdown);
+    // 评审面板仅在等待评审且是当前阶段时显示
+    const st = await api(`/api/projects/${currentProjectId}/status`);
+    const showReview = st.status === "waiting_review" && st.current_stage === stage;
+    document.getElementById("reviewPanel").style.display = showReview ? "block" : "none";
+    card.scrollIntoView({ behavior: "smooth" });
+  } catch (e) {
+    toast("加载产物失败：" + e.message, true);
+  }
+}
+
+/* 释放查看锁定：恢复轮询自动跟随当前评审阶段 */
+function releasePin() {
+  pinnedStage = null;
+  pinnedVersion = null;
+  document.getElementById("pinBar").style.display = "none";
+}
+
+/* 跟随当前进度：释放锁定并立刻刷新到最新评审阶段 */
+async function followCurrent() {
+  releasePin();
+  currentArtifactStage = null;
+  await refreshDetail();
+}
+
+/* 重新加载当前 pin 阶段（pin 期间该阶段产生新版本时由轮询提示后调用） */
+async function reloadPinned() {
+  const s = pinnedStage;
+  pinnedStage = null;  // 临时释放，loadArtifact 会重新 pin 并滚动
+  pinnedVersion = null;
+  if (s) await loadArtifact(s);
+}
+
+/* 轮询期间检查 pin 的阶段是否有新版本（如驳回后重出 v2） */
+async function checkPinnedVersion(st) {
+  if (!pinnedStage || !pinnedVersion) return;
+  const art = st.artifacts && st.artifacts[pinnedStage];
+  if (art && art.version > pinnedVersion) {
+    const bar = document.getElementById("pinBar");
+    const btn = document.getElementById("btnReloadPinned");
+    if (btn.style.display === "none") {
+      btn.style.display = "inline-block";
+      btn.textContent = `该阶段已有新版本 v${art.version}，点此刷新`;
+      btn.onclick = reloadPinned;
+    }
+  }
+}
+
+/* ---------- 日志 ---------- */
+async function renderLogs() {
+  if (!currentProjectId) return;
+  try {
+    const logs = await api(`/api/projects/${currentProjectId}/logs`);
+    const box = document.getElementById("logBox");
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    box.innerHTML = logs.map(l =>
+      `<div class="log-line"><span class="time">[${l.time}]</span> ` +
+      `<span class="lvl-${l.level}">${l.level}</span> ` +
+      `${l.stage ? `(${l.stage}) ` : ""}${escapeHtml(l.message)}</div>`).join("");
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  } catch (e) {}
+}
+
+/* ---------- 评审 ---------- */
+async function submitReview(approved) {
+  const comments = document.getElementById("reviewComments").value.trim();
+  if (!approved && !comments) { toast("驳回时必须填写评审意见", true); return; }
+  try {
+    await api(`/api/projects/${currentProjectId}/stages/${currentArtifactStage}/review`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ approved, comments }),
+    });
+    toast(approved ? "已通过，流水线继续执行" : "已驳回，智能体将根据意见修订");
+    document.getElementById("reviewComments").value = "";
+    document.getElementById("reviewPanel").style.display = "none";
+    releasePin();             // 评审提交后释放锁定，恢复自动跟随
+    currentArtifactStage = null;
+    refreshDetail();
+  } catch (e) {
+    toast("提交失败：" + e.message, true);
+  }
+}
+
+/* ---------- 上传与启动 ---------- */
+async function uploadFiles() {
+  const input = document.getElementById("fileInput");
+  if (!input.files.length) { toast("请先选择文件", true); return; }
+  for (const f of input.files) {
+    const fd = new FormData();
+    fd.append("file", f);
+    try {
+      await api(`/api/projects/${currentProjectId}/upload`, { method: "POST", body: fd });
+      toast(`已上传 ${f.name}`);
+    } catch (e) {
+      toast(`上传 ${f.name} 失败：${e.message}`, true);
+    }
+  }
+  input.value = "";
+  refreshDetail();
+}
+
+async function startPipeline() {
+  try {
+    await api(`/api/projects/${currentProjectId}/start`, { method: "POST" });
+    toast("流水线已启动");
+    refreshDetail();
+  } catch (e) {
+    toast("启动失败：" + e.message, true);
+  }
+}
+
+async function resetProject() {
+  if (!confirm("重置将清空该项目已有的全部产物与进度，确定重新开始吗？")) return;
+  try {
+    await api(`/api/projects/${currentProjectId}/reset`, { method: "POST" });
+    toast("已重置，可重新启动流水线");
+    releasePin();
+    currentArtifactStage = null;
+    document.getElementById("artifactCard").style.display = "none";
+    refreshDetail();
+  } catch (e) {
+    toast("重置失败：" + e.message, true);
+  }
+}
+
+async function resumePipeline() {
+  try {
+    await api(`/api/projects/${currentProjectId}/resume`, { method: "POST" });
+    toast("已从断点续跑，跳过已完成阶段");
+    refreshDetail();
+  } catch (e) {
+    toast("断点续跑失败：" + e.message, true);
+  }
+}
+
+function exportCases(fmt) {
+  window.open(`/api/projects/${currentProjectId}/export/testcases?format=${fmt}`, "_blank");
+}
+
+/* ---------- 新建项目 ---------- */
+async function createProject() {
+  const name = document.getElementById("newProjectName").value.trim();
+  if (!name) { toast("请输入项目名称", true); return; }
+  try {
+    const p = await api("/api/projects", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    document.getElementById("newProjectModal").style.display = "none";
+    document.getElementById("newProjectName").value = "";
+    await loadProjects();
+    selectProject(p.id);
+  } catch (e) {
+    toast("创建失败：" + e.message, true);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* ---------- 事件绑定 ---------- */
+document.getElementById("btnNewProject").onclick = () => {
+  document.getElementById("newProjectModal").style.display = "flex";
+};
+/* 上传区 / 阶段进度卡片标题点击折叠展开（省出内容查看空间） */
+["uploadCard", "stageCard"].forEach(id => {
+  const card = document.getElementById(id);
+  if (card) card.querySelector(".card-title").onclick = () => card.classList.toggle("collapsed");
+});
+document.getElementById("btnCancelNew").onclick = () => {
+  document.getElementById("newProjectModal").style.display = "none";
+};
+document.getElementById("btnConfirmNew").onclick = createProject;
+document.getElementById("newProjectName").onkeydown = e => {
+  if (e.key === "Enter") createProject();
+};
+document.getElementById("btnUpload").onclick = uploadFiles;
+document.getElementById("btnStart").onclick = startPipeline;
+document.getElementById("btnReset").onclick = resetProject;
+document.getElementById("btnResume").onclick = resumePipeline;
+document.getElementById("btnCancel").onclick = cancelPipeline;
+document.getElementById("btnApprove").onclick = () => submitReview(true);
+document.getElementById("btnReject").onclick = () => submitReview(false);
+document.getElementById("btnReleasePin").onclick = followCurrent;
+document.getElementById("btnThemeClassic").onclick = () => setDiagramTheme("classic");
+document.getElementById("btnThemeTech").onclick = () => setDiagramTheme("tech");
+updateDiagramThemeUI();
+
+/* ---------- 初始化 ---------- */
+loadProjects().catch(e => console.error(e));
+api("/api/meta").then(m => {
+  if (m.mock) document.getElementById("mockBadge").style.display = "block";
+}).catch(() => {});

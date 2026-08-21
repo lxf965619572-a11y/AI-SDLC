@@ -1,0 +1,28 @@
+# 密钥与本地配置（切勿提交真实 API Key）
+.env
+*.local
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行时数据（数据库、上传文件、解析缓存、日志、产物、单实例锁）
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+server.lock
+
+# WorkBuddy 项目数据
+.workbuddy/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 临时输出
+nohup.out
+/tmp/
