@@ -19,22 +19,82 @@
 
 ## 快速开始
 
+### 方式一：一键脚本（推荐新环境使用）
+
 ```bash
-# 1. 安装依赖（已存在 .venv 可跳过）
-.venv/Scripts/python.exe -m pip install -r requirements.txt
+# Windows：
+setup.bat          # 自动创建 .venv、安装依赖、生成 .env
+# （编辑 .env 配置 LLM，离线演示可不改）
+start.bat          # 启动，浏览器打开 http://127.0.0.1:5100
+
+# Linux / macOS：
+./setup.sh && ./start.sh
+```
+
+### 方式二：手动安装
+
+```bash
+# 1. 创建虚拟环境并安装依赖（需要 Python 3.10+）
+python -m venv .venv
+# Windows:
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+# Linux/macOS:
+# .venv/bin/python -m pip install -r requirements.txt
 
 # 2. 配置 LLM（二选一）
-cp .env.example .env
+cp .env.example .env   # Windows 用 copy .env.example .env
 # 方式A：离线演示模式（默认，无需 key，用内置模板生成产物）—— .env 中 LLM_MOCK=1
 # 方式B：真实模型 —— .env 中 LLM_MOCK=0，并填写 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL
 #        （OpenAI 兼容协议，DeepSeek/通义/火山等均可；支持按角色分别配置）
 
 # 3. 启动
-.venv/Scripts/python.exe app.py
+# Windows: .venv\Scripts\python.exe app.py
+# Linux/macOS: .venv/bin/python app.py
 # 浏览器打开 http://127.0.0.1:5100
 ```
 
 操作流程：新建项目 → 上传需求文档 → 启动流水线 → 逐阶段评审（通过/驳回+意见）→ 测试用例阶段可导出 Excel/XMind。
+
+## 部署与团队使用
+
+### 换电脑 / 给同事安装
+
+1. `git clone` 本仓库（或直接拷贝代码目录，**不含** `.venv/` 和 `data/`）；
+2. 目标机器安装 Python 3.10+（仅 Windows 需要 Git Bash 或直接双击 `.bat`）；
+3. 运行 `setup.bat`（Windows）或 `./setup.sh`（Linux/macOS）；
+4. 编辑 `.env` 填入自己的 `LLM_API_KEY`（离线演示可跳过），`start.bat` / `./start.sh` 启动。
+
+注意：
+- `.env` 含密钥，**已被 git 忽略**，不会随仓库分发，每台机器各自配置；
+- `data/`（数据库、上传文件、解析缓存、日志）不进仓库。新机器首次启动会自动创建空库，从零开始建项目；
+- 若要把旧机器上的**历史项目数据**带过去：整个拷贝旧机器的 `data/` 目录到新机器同位置即可（含项目、产物、上传的文档、解析缓存）；
+- 依赖全部是纯 Python 包（无 C 编译依赖），无需编译器，pip 直接装。
+
+### 局域网共享（让同事通过浏览器访问，不装环境）
+
+在一台常开的机器上部署后，把服务绑定到局域网：`.env` 中改
+
+```
+APP_HOST=0.0.0.0
+APP_DEBUG=0        # 共享时务必关闭 debug
+```
+
+重启后同事用 `http://<服务器IP>:5100` 访问。注意：
+
+- 系统当前**没有登录鉴权**，仅限内网可信环境使用；
+- 评审/导出等所有操作都会生效到同一个数据库，多人协作时注意项目归属；
+- 如需同时多人并行跑流水线，当前后台线程模型可以支持，但 LLM 并发受 `MAP_CONCURRENCY` 与 API 限流约束。
+
+### 环境变量一览
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `LLM_MOCK` | `0` | `=1` 离线演示，不调真实 LLM |
+| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | DeepSeek | OpenAI 兼容端点配置 |
+| `LLM_<角色>_*` | — | 按角色覆盖：EXTRACTION / REQUIREMENT / HLD / LLD / TESTCASE |
+| `APP_HOST` / `APP_PORT` | `127.0.0.1` / `5100` | 监听地址与端口 |
+| `APP_DEBUG` | `1` | 共享部署时置 `0` |
+| `MAP_CONCURRENCY` | `8` | 解析阶段 LLM 抽取并发批数 |
 
 ## 技术要点
 
