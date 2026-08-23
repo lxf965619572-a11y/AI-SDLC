@@ -1,7 +1,8 @@
 /* 多智能体软件开发流水线 - 前端逻辑 */
 
-const STAGES = ["parse", "requirement", "hld", "lld", "testcase"];
-const STAGE_NAMES = {
+/* 阶段定义以后端 /api/meta 为单一数据源；以下为兜底默认值（拉取失败时使用） */
+let STAGES = ["parse", "requirement", "hld", "lld", "testcase"];
+let STAGE_NAMES = {
   parse: "结构化原始数据",
   requirement: "软件需求规格说明书",
   hld: "概要设计说明书",
@@ -14,7 +15,6 @@ const STATUS_TEXT = {
 };
 
 let currentProjectId = null;
-let pollTimer = null;
 let currentArtifactStage = null;
 let pinnedStage = null;        // 用户手动查看的阶段（pin 期间轮询不自动切换）
 let pinnedVersion = null;      // pin 时查看的版本号（同阶段出新版时提示）
@@ -470,14 +470,50 @@ function resetDetailUI() {
   document.getElementById("btnResume").style.display = "none";
 }
 
-/* ---------- 轮询 ---------- */
+/* ---------- 轮询（按项目状态动态变速 + 标签页隐藏时暂停） ---------- */
+const POLL_FAST = 2500;      // 运行中/解析中：需要盯进度
+const POLL_REVIEW = 8000;    // 等待评审：变化只来自人，慢一点即可
+const POLL_IDLE = 15000;     // 待启动/已完成/已失败：几乎不变，低频保活
+
+let pollInterval = POLL_FAST;
+let pollTimer = null;
+
+function pollIntervalFor(status) {
+  if (status === "running" || status === "parsing") return POLL_FAST;
+  if (status === "waiting_review") return POLL_REVIEW;
+  return POLL_IDLE;
+}
+
 function startPolling() {
   stopPolling();
-  pollTimer = setInterval(refreshDetail, 2500);
+  scheduleNextPoll();
 }
+
+/* 每次刷新完成后按最新间隔排下一次（状态变了频率自动跟着变） */
+function scheduleNextPoll() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  if (!currentProjectId) return;
+  pollTimer = setTimeout(async () => {
+    if (document.visibilityState === "visible") await refreshDetail();
+    scheduleNextPoll();
+  }, pollInterval);
+}
+
 function stopPolling() {
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
 }
+
+/* 标签页切到后台停止轮询，回到前台立即刷新并恢复调度（省电省流量） */
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    // pollTimer 为 null 说明确实被暂停过，才需要恢复
+    if (currentProjectId && pollTimer === null) {
+      refreshDetail().finally(scheduleNextPoll);
+    }
+  } else if (document.visibilityState === "hidden") {
+    stopPolling();
+  }
+});
 
 /* ---------- 详情刷新 ---------- */
 async function refreshDetail() {
@@ -487,6 +523,7 @@ async function refreshDetail() {
   try {
     const st = await api(`/api/projects/${pid}/status`);
     if (token !== renderToken || pid !== currentProjectId) return; // 已切换，丢弃旧项目回包
+    pollInterval = pollIntervalFor(st.status);  // 按最新状态调整下一轮轮询间隔
     renderHeader(st);
     renderDocs(st.documents);
     renderStageTrack(st);
@@ -505,9 +542,10 @@ async function refreshDetail() {
         await loadArtifact(st.current_stage);
       }
     } else if (st.status === "completed" && !currentArtifactStage) {
-      // 已完成项目：自动展示最后一个阶段（测试用例）的产物，
+      // 已完成项目：自动展示最后一个阶段的产物，
       // 避免切换项目后中间内容区残留或空白
-      if (st.artifacts && st.artifacts["testcase"]) await loadArtifact("testcase");
+      const last = STAGES[STAGES.length - 1];
+      if (st.artifacts && st.artifacts[last]) await loadArtifact(last);
     } else if (st.status !== "waiting_review") {
       // 非评审状态：若已展示过产物则隐藏评审面板按钮
       if (currentArtifactStage && document.getElementById("artifactCard").style.display !== "none") {
@@ -836,4 +874,11 @@ updateDiagramThemeUI();
 loadProjects().catch(e => console.error(e));
 api("/api/meta").then(m => {
   if (m.mock) document.getElementById("mockBadge").style.display = "block";
+  // 阶段定义以后端为单一数据源：覆盖前端兜底默认值
+  if (Array.isArray(m.stages) && m.stages.length) STAGES = m.stages;
+  if (m.stage_names && typeof m.stage_names === "object") {
+    STAGE_NAMES = Object.assign({}, STAGE_NAMES, m.stage_names);
+  }
+  // 若已有选中的项目，按新阶段定义重绘一次阶段轨道
+  if (currentProjectId) refreshDetail();
 }).catch(() => {});

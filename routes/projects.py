@@ -16,7 +16,12 @@ ALLOWED_EXT = {".docx", ".pdf", ".md", ".txt"}
 
 @bp.get("/meta")
 def meta():
-    return jsonify({"mock": config.llm_mock_enabled()})
+    # 阶段定义为前后端单一数据源：后端 STAGES 不含 parse，前端展示需要含 parse 的完整流水线
+    return jsonify({
+        "mock": config.llm_mock_enabled(),
+        "stages": ["parse", *STAGES],
+        "stage_names": STAGE_TITLES,
+    })
 
 
 @bp.get("/projects")
