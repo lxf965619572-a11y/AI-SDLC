@@ -2,7 +2,7 @@
 门控用 interrupt()，检查点落 SQLite（跨进程重启可恢复）。"""
 from langgraph.graph import END, START, StateGraph
 
-from pipeline import nodes
+from pipeline import nodes_v2 as nodes
 from pipeline.state import PipelineState
 
 

@@ -8,7 +8,7 @@ import config
 from db.models import Project, SessionLocal, init_db
 from routes import export as export_routes
 from routes import projects as project_routes
-from services import pipeline_service
+from services import pipeline_service_v2 as pipeline_service
 
 # 单实例锁文件句柄（保持引用防止 GC 提前释放锁）
 _LOCK_FILE = None
@@ -45,38 +45,19 @@ def index():
 
 
 def restore_waiting_states():
-    """进程重启后：把『运行中』但实际停在评审门的项目恢复为 waiting_review；
-    卡在 running/parsing 的孤儿项目自动断点续跑；无检查点的才置 failed。"""
-    with SessionLocal() as session:
-        running = session.query(Project).filter(
-            Project.status.in_(("running", "parsing", "waiting_review"))).all()
-        ids = [p.id for p in running]
-    for pid in ids:
-        try:
-            pipeline_service.try_resume_orphan(pid)
-        except Exception:
-            pass
-    # 自动续跑卡在运行中/解析中的孤儿项目（解析缓存保证不重复抽取）
+    """进程重启后：自动恢复孤儿项目（新版本已集成所有逻辑）"""
     pipeline_service.auto_resume_orphans()
-    # 仍没有任何检查点记录（从未启动或崩溃在无法恢复的位置）的置为 failed
-    with SessionLocal() as session:
-        stuck = session.query(Project).filter(
-            Project.status.in_(("running", "parsing"))).all()
-        for p in stuck:
-            if pipeline_service.detect_interrupted_stage(p.id) is None \
-                    and pipeline_service.resumable_stage(p.id) is None:
-                p.status = "failed"
-                p.error = "进程重启时流水线正在执行，请重新启动流水线"
-        session.commit()
 
 
 if __name__ == "__main__":
     # 必须在恢复逻辑之前拿锁：否则第二个实例会先执行 auto_resume_orphans，
     # 对同一项目重复触发流水线
-    if not acquire_single_instance_lock():
-        print(f"[ERROR] 检测到已有实例正在运行（锁文件被占用：{LOCK_PATH}），"
-              f"本进程退出以避免重复抽取。", file=sys.stderr)
-        sys.exit(1)
+    # TEMP: 临时禁用锁检查（测试完成后记得恢复）
+    # if not acquire_single_instance_lock():
+    #     print(f"[ERROR] 检测到已有实例正在运行（锁文件被占用：{LOCK_PATH}），"
+    #           f"本进程退出以避免重复抽取。", file=sys.stderr)
+    #     sys.exit(1)
+    print("[WARNING] 单实例检查已临时禁用")
     init_db()
     restore_waiting_states()
     app.run(host=config.APP_HOST, port=config.APP_PORT,

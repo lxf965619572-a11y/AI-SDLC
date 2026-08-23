@@ -18,6 +18,7 @@ let pollTimer = null;
 let currentArtifactStage = null;
 let pinnedStage = null;        // 用户手动查看的阶段（pin 期间轮询不自动切换）
 let pinnedVersion = null;      // pin 时查看的版本号（同阶段出新版时提示）
+let renderToken = 0;           // 项目切换令牌：切换瞬间在途的旧项目异步回包凭此作废，防止覆盖新项目画面
 
 /* ---------- 图表主题：科技感（暗色+动效） / 经典（白底静态，适合插入文档） ---------- */
 
@@ -135,27 +136,51 @@ function attachZoomButton(container) {
   container.appendChild(btn);
 }
 
-/* ---------- 图表全屏放大查看 ---------- */
-const dzState = { scale: 1, tx: 0, ty: 0 };
+/* ---------- 图表全屏放大查看 ----------
+ * 清晰度关键：不用 CSS transform:scale() 缩放（那会把 SVG 先栅格化成位图再拉伸，
+ * 放大后模糊），而是直接改 svg 的 width/height —— SVG 是矢量，每次尺寸变化都
+ * 按目标像素重新绘制，任意倍率下线条和文字都锐利。
+ */
+const dzState = { scale: 1, tx: 0, ty: 0, natW: 800, natH: 600, fit: 1 };
 
 function dzApply() {
   const holder = document.getElementById("dzHolder");
-  holder.style.transform = `translate(calc(-50% + ${dzState.tx}px), calc(-50% + ${dzState.ty}px)) scale(${dzState.scale})`;
+  const svg = holder && holder.querySelector("svg");
+  if (!svg) return;
+  // 矢量缩放：按当前倍率直接设置渲染尺寸
+  svg.style.width = (dzState.natW * dzState.scale) + "px";
+  svg.style.height = (dzState.natH * dzState.scale) + "px";
+  holder.style.transform = `translate(calc(-50% + ${dzState.tx}px), calc(-50% + ${dzState.ty}px))`;
   document.getElementById("dzScale").textContent = Math.round(dzState.scale * 100) + "%";
 }
 
 /* 让图表以 90% 视口尺寸完整显示（fit） */
 function dzFit() {
-  const holder = document.getElementById("dzHolder");
   const vp = document.getElementById("dzViewport");
-  const svg = holder.querySelector("svg");
-  if (!svg) return;
-  const sw = svg.getBoundingClientRect().width / dzState.scale;
-  const sh = svg.getBoundingClientRect().height / dzState.scale;
-  const fit = Math.min((vp.clientWidth * 0.92) / sw, (vp.clientHeight * 0.9) / sh);
-  dzState.scale = Math.max(0.05, Math.min(fit, 8));
+  if (!vp.clientWidth || !vp.clientHeight) return;
+  const fit = Math.min((vp.clientWidth * 0.92) / dzState.natW,
+                       (vp.clientHeight * 0.9) / dzState.natH);
+  dzState.fit = fit;
+  dzState.scale = Math.max(0.05, Math.min(fit, 16));
   dzState.tx = 0; dzState.ty = 0;
   dzApply();
+}
+
+/* 读取 svg 自然尺寸：优先 viewBox，其次 width 属性，兜底测量渲染尺寸 */
+function dzMeasure(svg) {
+  let w = 0, h = 0;
+  const vb = svg.viewBox && svg.viewBox.baseVal;
+  if (vb && vb.width > 0 && vb.height > 0) { w = vb.width; h = vb.height; }
+  if (!w || !h) {
+    const aw = parseFloat(svg.getAttribute("width")) || 0;
+    const ah = parseFloat(svg.getAttribute("height")) || 0;
+    if (aw > 0 && ah > 0) { w = aw; h = ah; }
+  }
+  if (!w || !h) {
+    const r = svg.getBoundingClientRect();
+    w = r.width || 800; h = r.height || 600;
+  }
+  return { w, h };
 }
 
 function openDiagramZoom(container) {
@@ -167,8 +192,12 @@ function openDiagramZoom(container) {
   // 克隆 svg（保留内联样式/滤镜），并给浮层里的 svg 解除 max-width 限制
   const clone = svg.cloneNode(true);
   clone.style.maxWidth = "none";
+  clone.style.maxHeight = "none";
   clone.style.background = "transparent";
+  clone.removeAttribute("height");
   holder.appendChild(clone);
+  const m = dzMeasure(clone);
+  dzState.natW = m.w; dzState.natH = m.h;
   // 标题：取容器前最近的标题文本
   let title = "图表预览";
   let prev = container.previousElementSibling;
@@ -192,23 +221,23 @@ function closeDiagramZoom() {
   const vp = document.getElementById("dzViewport");
   document.getElementById("dzClose").onclick = closeDiagramZoom;
   document.getElementById("dzFit").onclick = dzFit;
+  // “1:1”= 按图的自然像素尺寸显示
   document.getElementById("dzReset").onclick = () => { dzState.scale = 1; dzState.tx = 0; dzState.ty = 0; dzApply(); };
-  document.getElementById("dzZoomIn").onclick = () => { dzState.scale = Math.min(8, dzState.scale * 1.25); dzApply(); };
+  document.getElementById("dzZoomIn").onclick = () => { dzState.scale = Math.min(16, dzState.scale * 1.25); dzApply(); };
   document.getElementById("dzZoomOut").onclick = () => { dzState.scale = Math.max(0.05, dzState.scale / 1.25); dzApply(); };
   overlay.addEventListener("click", e => { if (e.target === overlay) closeDiagramZoom(); });
   document.addEventListener("keydown", e => {
     if (overlay.style.display !== "none" && overlay.style.display !== "") {
       if (e.key === "Escape") closeDiagramZoom();
-      if (e.key === "+") { dzState.scale = Math.min(8, dzState.scale * 1.25); dzApply(); }
+      if (e.key === "+") { dzState.scale = Math.min(16, dzState.scale * 1.25); dzApply(); }
       if (e.key === "-") { dzState.scale = Math.max(0.05, dzState.scale / 1.25); dzApply(); }
     }
   });
-  // 滚轮缩放
+  // 滚轮缩放：以鼠标位置为中心（指哪放大哪，便于细看复杂图）
   vp.addEventListener("wheel", e => {
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-    dzState.scale = Math.max(0.05, Math.min(8, dzState.scale * factor));
-    dzApply();
+    zoomAt(e.clientX, e.clientY, factor);
   }, { passive: false });
   // 拖动平移
   let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
@@ -224,7 +253,27 @@ function closeDiagramZoom() {
   });
   window.addEventListener("mouseup", () => { dragging = false; vp.classList.remove("dragging"); });
   vp.addEventListener("dblclick", dzFit);
+  // 窗口尺寸变化时重新适应
+  window.addEventListener("resize", () => {
+    if (overlay.style.display === "flex") dzFit();
+  });
 })();
+
+/* 以视口内某一点 (cx, cy) 为中心缩放，保持该点下的内容不动 */
+function zoomAt(cx, cy, factor) {
+  const vp = document.getElementById("dzViewport");
+  const rect = vp.getBoundingClientRect();
+  const s1 = dzState.scale;
+  const s2 = Math.max(0.05, Math.min(16, s1 * factor));
+  if (s2 === s1) return;
+  const vcx = rect.left + rect.width / 2;
+  const vcy = rect.top + rect.height / 2;
+  const k = s2 / s1;
+  dzState.tx = (cx - vcx) * (1 - k) + dzState.tx * k;
+  dzState.ty = (cy - vcy) * (1 - k) + dzState.ty * k;
+  dzState.scale = s2;
+  dzApply();
+}
 
 /* 主题切换：记忆偏好 → 重新 initialize → 用保存的源码重渲染页面内所有图表 */
 function setDiagramTheme(theme) {
@@ -391,14 +440,34 @@ async function loadProjects() {
 }
 
 function selectProject(pid) {
+  if (currentProjectId === pid) return;
   currentProjectId = pid;
+  renderToken++;               // 作废所有在途的旧项目异步回包
   releasePin();  // 切换项目时释放查看锁定
   currentArtifactStage = null;
+  resetDetailUI();             // 立即清空上一个项目的内容区，避免残留
   document.getElementById("emptyState").style.display = "none";
   document.getElementById("detail").style.display = "block";
   loadProjects();
   refreshDetail();
   startPolling();
+}
+
+/* 切换项目时重置详情区：隐藏产物卡、清空正文、收起日志与文档列表，
+ * 阶段轨道交给紧随其后的 refreshDetail 重新渲染。 */
+function resetDetailUI() {
+  document.getElementById("artifactCard").style.display = "none";
+  document.getElementById("artifactBody").innerHTML = "";
+  document.getElementById("artifactTitle").textContent = "";
+  document.getElementById("artifactVersion").textContent = "";
+  document.getElementById("reviewPanel").style.display = "none";
+  document.getElementById("reviewComments").value = "";
+  document.getElementById("stageTrack").innerHTML = "";
+  document.getElementById("logBox").innerHTML = "";
+  document.getElementById("exportCard").style.display = "none";
+  document.getElementById("btnReloadPinned").style.display = "none";
+  document.getElementById("btnCancel").style.display = "none";
+  document.getElementById("btnResume").style.display = "none";
 }
 
 /* ---------- 轮询 ---------- */
@@ -413,8 +482,11 @@ function stopPolling() {
 /* ---------- 详情刷新 ---------- */
 async function refreshDetail() {
   if (!currentProjectId) return;
+  const token = renderToken;     // 快照：回包后若项目已切换则整包作废
+  const pid = currentProjectId;
   try {
-    const st = await api(`/api/projects/${currentProjectId}/status`);
+    const st = await api(`/api/projects/${pid}/status`);
+    if (token !== renderToken || pid !== currentProjectId) return; // 已切换，丢弃旧项目回包
     renderHeader(st);
     renderDocs(st.documents);
     renderStageTrack(st);
@@ -423,6 +495,7 @@ async function refreshDetail() {
     // 用户手动查看（pin）期间：保持显示 pin 的阶段，绝不自动切换
     if (pinnedStage) {
       if (currentArtifactStage !== pinnedStage) await loadArtifact(pinnedStage);
+      if (token !== renderToken) return;
       await checkPinnedVersion(st);
       return;
     }
@@ -431,6 +504,10 @@ async function refreshDetail() {
       if (currentArtifactStage !== st.current_stage) {
         await loadArtifact(st.current_stage);
       }
+    } else if (st.status === "completed" && !currentArtifactStage) {
+      // 已完成项目：自动展示最后一个阶段（测试用例）的产物，
+      // 避免切换项目后中间内容区残留或空白
+      if (st.artifacts && st.artifacts["testcase"]) await loadArtifact("testcase");
     } else if (st.status !== "waiting_review") {
       // 非评审状态：若已展示过产物则隐藏评审面板按钮
       if (currentArtifactStage && document.getElementById("artifactCard").style.display !== "none") {
@@ -540,8 +617,11 @@ function renderExport(st) {
 /* ---------- 产物渲染 ---------- */
 async function loadArtifact(stage) {
   currentArtifactStage = stage;
+  const token = renderToken;   // 快照：加载期间切换项目则丢弃本次渲染
+  const pid = currentProjectId;
   try {
-    const art = await api(`/api/projects/${currentProjectId}/stages/${stage}/artifact`);
+    const art = await api(`/api/projects/${pid}/stages/${stage}/artifact`);
+    if (token !== renderToken || pid !== currentProjectId) return; // 已切换，作废
     pinnedStage = stage;               // 打开产物即锁定，轮询不再自动切走
     pinnedVersion = art.version;
     const card = document.getElementById("artifactCard");
@@ -553,17 +633,20 @@ async function loadArtifact(stage) {
       `正在查看：${STAGE_NAMES[stage] || stage} v${art.version}（已锁定，轮询不会切换）`;
     document.getElementById("btnReloadPinned").style.display = "none";
     document.getElementById("btnExportDocx").onclick = () =>
-      window.open(`/api/projects/${currentProjectId}/stages/${stage}/export?format=docx`, "_blank");
+      window.open(`/api/projects/${pid}/stages/${stage}/export?format=docx`, "_blank");
     document.getElementById("btnExportMd").onclick = () =>
-      window.open(`/api/projects/${currentProjectId}/stages/${stage}/export?format=md`, "_blank");
+      window.open(`/api/projects/${pid}/stages/${stage}/export?format=md`, "_blank");
     renderMarkdown(art.markdown);
     // 评审面板仅在等待评审且是当前阶段时显示
-    const st = await api(`/api/projects/${currentProjectId}/status`);
+    const st = await api(`/api/projects/${pid}/status`);
+    if (token !== renderToken || pid !== currentProjectId) return;
     const showReview = st.status === "waiting_review" && st.current_stage === stage;
     document.getElementById("reviewPanel").style.display = showReview ? "block" : "none";
     card.scrollIntoView({ behavior: "smooth" });
   } catch (e) {
-    toast("加载产物失败：" + e.message, true);
+    if (token === renderToken && pid === currentProjectId) {
+      toast("加载产物失败：" + e.message, true);
+    }
   }
 }
 
@@ -607,8 +690,11 @@ async function checkPinnedVersion(st) {
 /* ---------- 日志 ---------- */
 async function renderLogs() {
   if (!currentProjectId) return;
+  const token = renderToken;
+  const pid = currentProjectId;
   try {
-    const logs = await api(`/api/projects/${currentProjectId}/logs`);
+    const logs = await api(`/api/projects/${pid}/logs`);
+    if (token !== renderToken || pid !== currentProjectId) return; // 已切换，丢弃旧项目日志
     const box = document.getElementById("logBox");
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
     box.innerHTML = logs.map(l =>

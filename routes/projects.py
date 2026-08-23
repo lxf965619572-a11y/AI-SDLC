@@ -7,7 +7,7 @@ from flask import Blueprint, jsonify, request
 import config
 from db.models import Document, PipelineLog, Project, SessionLocal, StageArtifact
 from pipeline.nodes import STAGES, STAGE_TITLES
-from services import pipeline_service
+from services import pipeline_service_v2 as pipeline_service
 
 bp = Blueprint("projects", __name__, url_prefix="/api")
 
@@ -54,7 +54,8 @@ def upload(pid: int):
         return jsonify({"error": f"不支持的文件类型 {ext}，支持 {sorted(ALLOWED_EXT)}"}), 400
 
     with SessionLocal() as session:
-        if not session.get(Project, pid):
+        proj = session.get(Project, pid)
+        if not proj:
             return jsonify({"error": "项目不存在"}), 404
         # 同名文档去重：同项目已存在同名文件则直接拒绝，避免重复抽取
         exists = session.query(Document).filter_by(
@@ -69,6 +70,11 @@ def upload(pid: int):
         doc = Document(project_id=pid, filename=f.filename, stored_path=str(path),
                        file_type=ftype)
         session.add(doc)
+
+        # 上传文档后，将状态从 CREATED 转换为 READY
+        if proj.status == "created":
+            proj.status = "ready"
+
         session.commit()
         return jsonify({"id": doc.id, "filename": doc.filename, "file_type": ftype})
 
@@ -88,24 +94,28 @@ def delete_document(pid: int, doc_id: int):
         from db.models import Chunk
         session.query(Chunk).filter_by(document_id=doc.id).delete()
         session.delete(doc)
+
+        # 删除文档后，检查是否还有其他文档
+        remaining_docs = session.query(Document).filter_by(project_id=pid).count()
+        if remaining_docs == 0 and p.status == "ready":
+            # 没有文档了，状态回到 CREATED
+            p.status = "created"
+
         session.commit()
         return jsonify({"ok": True})
 
 
 @bp.post("/projects/<int:pid>/start")
 def start(pid: int):
+    # 状态检查已经在 pipeline_service_v2.start_pipeline 中完成
+    # 这里只检查项目是否存在
     with SessionLocal() as session:
         p = session.get(Project, pid)
         if not p:
             return jsonify({"error": "项目不存在"}), 404
-        if p.status not in ("created", "failed"):
-            return jsonify({"error": f"当前状态 {p.status} 不允许启动"}), 400
-        has_doc = session.query(Document).filter_by(project_id=pid).count() > 0
-        if not has_doc:
-            return jsonify({"error": "请先上传需求文档"}), 400
-    ok = pipeline_service.start_pipeline(pid)
-    if not ok:
-        return jsonify({"error": "流水线已在运行中"}), 409
+    success, message = pipeline_service.start_pipeline(pid)
+    if not success:
+        return jsonify({"error": message}), 409
     return jsonify({"ok": True})
 
 
@@ -115,10 +125,9 @@ def reset(pid: int):
         p = session.get(Project, pid)
         if not p:
             return jsonify({"error": "项目不存在"}), 404
-    try:
-        pipeline_service.reset_project(pid)
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 409
+    success, message = pipeline_service.reset_project(pid)
+    if not success:
+        return jsonify({"error": message}), 409
     return jsonify({"ok": True})
 
 
@@ -131,11 +140,11 @@ def resume(pid: int):
             return jsonify({"error": "项目不存在"}), 404
         if p.status != "failed":
             return jsonify({"error": f"当前状态 {p.status} 无需断点续跑"}), 400
-    if not pipeline_service.resumable_stage(pid):
+    if not pipeline_service._get_resumable_stage(pid):
         return jsonify({"error": "无可续跑的检查点，请使用重置重跑"}), 409
-    ok = pipeline_service.resume_pipeline(pid)
-    if not ok:
-        return jsonify({"error": "流水线已在运行中"}), 409
+    success, message = pipeline_service.resume_pipeline(pid)
+    if not success:
+        return jsonify({"error": message}), 409
     return jsonify({"ok": True})
 
 
@@ -172,7 +181,7 @@ def status(pid: int):
         # 失败时检查是否存在可续跑的检查点（失败前已有阶段成功完成）
         resumable = False
         if p.status == "failed":
-            resumable = bool(pipeline_service.resumable_stage(pid))
+            resumable = bool(pipeline_service._get_resumable_stage(pid))
         return jsonify({
             "id": p.id, "name": p.name, "status": p.status,
             "current_stage": p.current_stage, "error": p.error,
@@ -208,9 +217,9 @@ def review(pid: int, stage: str):
             return jsonify({"error": "项目不存在"}), 404
         if p.status != "waiting_review" or p.current_stage != stage:
             return jsonify({"error": f"当前阶段 {p.current_stage}（状态 {p.status}）不在等待评审"}), 409
-    ok = pipeline_service.submit_review(pid, approved, comments)
-    if not ok:
-        return jsonify({"error": "流水线正忙，请稍后重试"}), 409
+    success, message = pipeline_service.submit_review(pid, approved, comments)
+    if not success:
+        return jsonify({"error": message}), 409
     return jsonify({"ok": True})
 
 
