@@ -54,12 +54,22 @@ def search(query: str, count: int | None = None) -> list[dict]:
         return []
 
 
+_NEWS_HINTS = ("今天", "今日", "最新", "新闻", "近期", "最近", "本周", "热点", "动态")
+
+
+def _news_intent(query: str) -> bool:
+    """简单意图判断：问新闻/时效性问题时收紧时间范围，否则常规检索。"""
+    return any(k in query for k in _NEWS_HINTS)
+
+
 def _search_bocha(query: str, count: int, key: str) -> list[dict]:
+    # 新闻类查询限定近一周，常规查询不限时间
+    freshness = "oneWeek" if _news_intent(query) else "noLimit"
     resp = httpx.post(
         "https://api.bochaai.com/v1/web-search",
         headers={"Authorization": f"Bearer {key}",
                  "Content-Type": "application/json"},
-        json={"query": query, "freshness": "noLimit",
+        json={"query": query, "freshness": freshness,
               "count": count, "summary": True},
         timeout=SEARCH_TIMEOUT)
     resp.raise_for_status()
@@ -69,11 +79,13 @@ def _search_bocha(query: str, count: int, key: str) -> list[dict]:
 
 
 def _search_tavily(query: str, count: int, key: str) -> list[dict]:
-    resp = httpx.post(
-        "https://api.tavily.com/search",
-        json={"api_key": key, "query": query,
-              "max_results": count, "search_depth": "basic"},
-        timeout=SEARCH_TIMEOUT)
+    payload = {"api_key": key, "query": query,
+               "topic": "news" if _news_intent(query) else "general",
+               "max_results": count, "search_depth": "basic"}
+    if _news_intent(query):
+        payload["days"] = 7  # 新闻类查询限定近 7 天，提高时效性
+    resp = httpx.post("https://api.tavily.com/search",
+                      json=payload, timeout=SEARCH_TIMEOUT)
     resp.raise_for_status()
     return _normalize(resp.json().get("results") or [],
                       title_key="title", url_key="url", snippet_key="content")
@@ -111,9 +123,10 @@ def format_as_context(results: list[dict]) -> str:
     """把搜索结果格式化为注入 system prompt 的参考块。"""
     if not results:
         return ""
-    lines = ["\n\n【网络搜索结果】以下为互联网检索结果，仅供补充参考；"
-             "可能与项目文档冲突或已过时，冲突时以项目产物为准，"
-             "引用网络信息时请标注来源："]
+    lines = ["\n\n【网络搜索结果】以下为互联网检索结果（含发布日期/时间），仅供补充参考；"
+             "可能与项目文档冲突或已过时，冲突时以项目产物为准。"
+             "回答网络相关问题时请充分利用这些结果，按相关性与日期组织回答并注明信息来源；"
+             "结果中没有的内容不要编造，但已有结果中的信息应直接、完整地呈现给用户："]
     for i, r in enumerate(results, 1):
         lines.append(f"{i}. {r['title']}"
                      + (f"（{r['url']}）" if r["url"] else ""))

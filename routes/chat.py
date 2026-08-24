@@ -94,7 +94,11 @@ def chat():
         history = []
 
     project_name, ctx = _build_project_context(pid) if pid else ("", "")
-    sys_content = SYSTEM_PROMPT
+    # 注入真实当前日期：模型自身时间感知不可靠，判断『今天/最近』需要以此为准
+    import datetime as _dt
+    sys_content = SYSTEM_PROMPT + (
+        f"\n\n【当前日期：{_dt.date.today().isoformat()}】"
+        "涉及『今天/最近/最新』等时间判断一律以此日期为准。")
     if ctx:
         sys_content += f"\n\n【当前项目：{project_name}】\n{ctx}"
 
