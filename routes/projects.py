@@ -17,10 +17,13 @@ ALLOWED_EXT = {".docx", ".pdf", ".md", ".txt"}
 @bp.get("/meta")
 def meta():
     # 阶段定义为前后端单一数据源：后端 STAGES 不含 parse，前端展示需要含 parse 的完整流水线
+    from core import web_search
     return jsonify({
         "mock": config.llm_mock_enabled(),
         "stages": ["parse", *STAGES],
         "stage_names": STAGE_TITLES,
+        # 联网检索配置级开关：未配置 key 时前端不显示「联网」按钮
+        "web_search_enabled": web_search.enabled(),
     })
 
 

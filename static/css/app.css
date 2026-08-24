@@ -307,13 +307,21 @@ body {
 @keyframes chatCursorBlink { 50% { opacity: 0; } }
 .chat-input-row {
   display: flex; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--border);
-  flex: none; align-items: flex-end;
+  flex: none; align-items: stretch;
 }
 .chat-input-row textarea {
   flex: 1; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
   font-family: inherit; font-size: 13px; resize: none;
 }
 .chat-input-row textarea:focus { outline: none; border-color: var(--primary); }
+.chat-input-side { display: flex; flex-direction: column; gap: 6px; justify-content: flex-end; }
+/* 联网开关：默认关；仅当后端配置了搜索 key 时才显示 */
+.web-switch {
+  display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-sub);
+  cursor: pointer; user-select: none; white-space: nowrap; padding: 2px 0;
+}
+.web-switch input { margin: 0; cursor: pointer; }
+.web-switch.on { color: var(--primary); font-weight: 600; }
 
 /* ---- 弹窗 ---- */
 .modal {

@@ -915,6 +915,8 @@ async function sendChat() {
         project_id: currentProjectId,
         message: msg,
         history: chatHistory.slice(-12),
+        // 联网检索开关：默认关，仅当 .env 配置了搜索 key 时才可能出现
+        use_web: document.getElementById("chatWebSwitch").checked,
       }),
     });
     if (!resp.ok || !resp.body) {
@@ -1018,6 +1020,15 @@ api("/api/meta").then(m => {
   if (m.stage_names && typeof m.stage_names === "object") {
     STAGE_NAMES = Object.assign({}, STAGE_NAMES, m.stage_names);
   }
+  // 联网检索：仅当后端配置了搜索 key 才显示开关（配置级总开关）
+  if (m.web_search_enabled) {
+    document.getElementById("webSwitchWrap").style.display = "flex";
+  }
   // 若已有选中的项目，按新阶段定义重绘一次阶段轨道
   if (currentProjectId) refreshDetail();
 }).catch(() => {});
+
+/* 联网开关样式随勾选状态变化（默认关） */
+document.getElementById("chatWebSwitch").addEventListener("change", e => {
+  document.getElementById("webSwitchWrap").classList.toggle("on", e.target.checked);
+});

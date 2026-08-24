@@ -1,15 +1,22 @@
-"""AI 助手对话接口：基于当前项目产物上下文，与大模型流式对话。"""
+"""AI 助手对话接口：基于当前项目产物上下文，与大模型流式对话。
+支持两类检索增强（方案 B）：
+1. 项目文档检索：BM25 对上传文档的分块做精准检索，只喂最相关片段（本地，无网络）；
+2. 联网搜索：开关打开且配置了 WEB_SEARCH_API_KEY 时，先调搜索 API 把结果并入上下文（失败不阻断）。
+"""
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 
-from db.models import Project, SessionLocal, StageArtifact
+from db.models import Chunk, Document, Project, SessionLocal, StageArtifact
 from pipeline.nodes import STAGES, STAGE_TITLES
-from core import llm_client
+from core import llm_client, web_search
 from core.llm_client import LLMError
 
 bp = Blueprint("chat", __name__, url_prefix="/api")
 
 # 单阶段上下文截断长度（防止超上下文窗口）
 CTX_MAX_PER_STAGE = 6000
+# BM25 项目检索返回的片段数 / 单片段最大字符数
+CHUNK_TOP_K = 5
+CHUNK_MAX_CHARS = 800
 
 SYSTEM_PROMPT = (
     "你是「多智能体软件开发流水线」系统的 AI 助手。用户正在评审/查看一个软件研发项目，"
@@ -43,12 +50,44 @@ def _build_project_context(pid: int) -> tuple[str, str]:
         return name, "".join(parts) if parts else "（该项目尚无阶段产物）"
 
 
+def _retrieve_project_chunks(pid: int, query: str) -> str:
+    """用 BM25 对该项目上传文档的分块做检索，返回最相关的若干片段（本地计算）。
+    没有分块或检索异常时返回空串，不影响主流程。"""
+    try:
+        from parsing.retriever import BM25Retriever
+        with SessionLocal() as session:
+            rows = (session.query(Chunk, Document.filename)
+                    .join(Document, Chunk.document_id == Document.id)
+                    .filter(Document.project_id == pid).all())
+            if not rows:
+                return ""
+            # 拼接 标题+内容 作为可检索文本
+            texts = [((c.heading + "。") if c.heading else "") + c.content
+                     for c, _ in rows]
+            sources = [f for _, f in rows]
+        retr = BM25Retriever(texts)
+        hits = retr.top_k(query, k=CHUNK_TOP_K)
+        if not hits:
+            return ""
+        parts = ["\n\n【项目文档检索 · 与问题最相关的原始片段】"]
+        for idx, text, _score in hits:
+            # top_k 返回的第一个元素即原始下标，直接定位来源文件名
+            fname = sources[idx] if idx < len(sources) else ""
+            snip = text[:CHUNK_MAX_CHARS]
+            head = f"（来源：{fname}）" if fname else ""
+            parts.append(f"- {head}\n{snip}")
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
 @bp.post("/chat")
 def chat():
     data = request.json or {}
     pid = data.get("project_id")
     message = (data.get("message") or "").strip()
     history = data.get("history") or []
+    use_web = bool(data.get("use_web"))
     if not message:
         return jsonify({"error": "消息不能为空"}), 400
     if not isinstance(history, list):
@@ -58,6 +97,19 @@ def chat():
     sys_content = SYSTEM_PROMPT
     if ctx:
         sys_content += f"\n\n【当前项目：{project_name}】\n{ctx}"
+
+    # 项目文档检索增强：BM25 命中最相关片段（本地、无需联网、无副作用）
+    if pid:
+        chunk_ctx = _retrieve_project_chunks(pid, message)
+        if chunk_ctx:
+            sys_content += chunk_ctx
+
+    # 联网搜索：仅当用户打开开关且配置了 key 时；失败静默降级
+    if use_web and web_search.enabled():
+        results = web_search.search(message)
+        web_ctx = web_search.format_as_context(results)
+        if web_ctx:
+            sys_content += web_ctx
 
     # 历史窗口：最多带最近 12 条（6 轮），控制上下文体积
     hist = [m for m in history[-12:]

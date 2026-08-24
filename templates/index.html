@@ -136,7 +136,14 @@
     </div>
     <div class="chat-input-row">
       <textarea id="chatInput" rows="2" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
-      <button class="btn btn-primary" id="btnChatSend">发送</button>
+      <div class="chat-input-side">
+        <label class="web-switch" id="webSwitchWrap" style="display:none"
+               title="开启后 AI 回答前会先联网检索（仅当 .env 配置了 WEB_SEARCH_API_KEY 时可用）">
+          <input type="checkbox" id="chatWebSwitch">
+          <span>🌐 联网</span>
+        </label>
+        <button class="btn btn-primary" id="btnChatSend">发送</button>
+      </div>
     </div>
   </aside>
 </div>
