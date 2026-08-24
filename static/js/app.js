@@ -559,6 +559,9 @@ async function refreshDetail() {
 
 function renderHeader(st) {
   document.getElementById("projName").textContent = st.name;
+  // 助手面板上下文标签跟随当前项目
+  const ctxEl = document.getElementById("chatCtx");
+  if (ctxEl) ctxEl.textContent = "上下文：" + st.name;
   const pill = document.getElementById("projStatus");
   pill.textContent = STATUS_TEXT[st.status] || st.status;
   pill.className = "status-pill st-" + st.status;
@@ -842,6 +845,132 @@ function escapeHtml(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+/* ---------- AI 助手（右侧可收起对话面板） ----------
+ * 后端 /api/chat 以 SSE 流式返回 {delta} 增量，前端用 fetch + ReadableStream
+ * 逐块解析实时渲染；多轮历史由前端维护（最近 6 轮 = 12 条）随请求带上。
+ * 上下文由后端按当前 project_id 组装各阶段产物，前端只需传项目 id。
+ */
+let chatHistory = [];          // [{role, content}]，发送时作为 history 传给后端
+let chatBusy = false;          // 正在流式输出时禁止重复发送
+
+function chatPanel() { return document.getElementById("chatPanel"); }
+
+function toggleChatPanel(forceOpen) {
+  const p = chatPanel();
+  const open = forceOpen === true ? true : p.classList.contains("collapsed");
+  p.classList.toggle("collapsed", !open);
+  if (open) document.getElementById("chatInput").focus();
+}
+
+function toggleSidebar() {
+  document.getElementById("sidebar").classList.toggle("collapsed");
+}
+
+function addChatMsg(role, text) {
+  const box = document.getElementById("chatMessages");
+  const empty = box.querySelector(".chat-empty");
+  if (empty) empty.remove();
+  const wrap = document.createElement("div");
+  wrap.className = "chat-msg " + role;
+  const roleLabel = role === "user" ? "我" : role === "error" ? "提示" : "AI 助手";
+  const body = document.createElement("div");
+  body.className = "cm-body";
+  if (role === "user") {
+    body.textContent = text;
+  } else {
+    // 助手回复按 Markdown 渲染；流式未开始/进行中显示闪烁光标（表示"正在回复"）
+    body.innerHTML = text ? marked.parse(text) : '<span class="chat-cursor"></span>';
+  }
+  wrap.innerHTML = `<div class="cm-role">${roleLabel}</div>`;
+  wrap.appendChild(body);
+  box.appendChild(wrap);
+  box.scrollTop = box.scrollHeight;
+  return body;
+}
+
+/* 把流式累积的纯文本实时渲染为 Markdown（末尾挂闪烁光标） */
+function renderStreaming(body, acc) {
+  body.innerHTML = marked.parse(acc || "") + '<span class="chat-cursor"></span>';
+  const box = document.getElementById("chatMessages");
+  box.scrollTop = box.scrollHeight;
+}
+
+async function sendChat() {
+  if (chatBusy) return;
+  const input = document.getElementById("chatInput");
+  const msg = input.value.trim();
+  if (!msg) return;
+  input.value = "";
+  addChatMsg("user", msg);
+  chatBusy = true;
+  document.getElementById("btnChatSend").disabled = true;
+
+  const body = addChatMsg("assistant", "");
+  let acc = "";
+  try {
+    const resp = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project_id: currentProjectId,
+        message: msg,
+        history: chatHistory.slice(-12),
+      }),
+    });
+    if (!resp.ok || !resp.body) {
+      let emsg = `HTTP ${resp.status}`;
+      try { emsg = (await resp.json()).error || emsg; } catch (e) {}
+      throw new Error(emsg);
+    }
+    // 逐块读取 SSE：每条事件形如  data: {...}\n\n
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    let streamErr = null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // 按 SSE 事件边界（空行）切分
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const raw = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        for (const line of raw.split("\n")) {
+          if (!line.startsWith("data: ")) continue;
+          let payload;
+          try { payload = JSON.parse(line.slice(6)); } catch (e) { continue; }
+          if (payload.delta) { acc += payload.delta; renderStreaming(body, acc); }
+          else if (payload.error) { streamErr = payload.error; }
+          else if (payload.done) { /* 正常结束 */ }
+        }
+      }
+    }
+    if (streamErr) throw new Error(streamErr);
+    if (!acc) acc = "（未收到回复内容）";
+    body.innerHTML = marked.parse(acc);
+    chatHistory.push({ role: "user", content: msg });
+    chatHistory.push({ role: "assistant", content: acc });
+  } catch (e) {
+    body.closest(".chat-msg").classList.add("error");
+    body.innerHTML = "回复失败：" + escapeHtml(e.message);
+  } finally {
+    chatBusy = false;
+    document.getElementById("btnChatSend").disabled = false;
+    document.getElementById("chatMessages").scrollTop =
+      document.getElementById("chatMessages").scrollHeight;
+  }
+}
+
+function clearChat() {
+  chatHistory = [];
+  const box = document.getElementById("chatMessages");
+  box.innerHTML = "";
+  // 恢复引导占位
+  box.insertAdjacentHTML("beforeend",
+    `<div class="chat-empty"><p>对话已清空，可继续提问。</p></div>`);
+}
+
 /* ---------- 事件绑定 ---------- */
 document.getElementById("btnNewProject").onclick = () => {
   document.getElementById("newProjectModal").style.display = "flex";
@@ -869,6 +998,16 @@ document.getElementById("btnReleasePin").onclick = followCurrent;
 document.getElementById("btnThemeClassic").onclick = () => setDiagramTheme("classic");
 document.getElementById("btnThemeTech").onclick = () => setDiagramTheme("tech");
 updateDiagramThemeUI();
+
+/* AI 助手面板 + 侧栏收起 */
+document.getElementById("btnToggleChat").onclick = () => toggleChatPanel(true);
+document.getElementById("btnChatCollapse").onclick = () => chatPanel().classList.add("collapsed");
+document.getElementById("btnChatClear").onclick = clearChat;
+document.getElementById("btnChatSend").onclick = sendChat;
+document.getElementById("chatInput").addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
+document.getElementById("btnToggleSidebar").onclick = toggleSidebar;
 
 /* ---------- 初始化 ---------- */
 loadProjects().catch(e => console.error(e));

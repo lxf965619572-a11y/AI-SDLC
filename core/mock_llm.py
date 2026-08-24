@@ -16,6 +16,31 @@ def _digest(text: str, n: int = 4) -> str:
 def mock_complete(messages: list[dict], role: str) -> str:
     prompt = _prompt_of(messages)
 
+    # ---- AI 助手对话（离线演示）----
+    if role == "chat":
+        # 取最后一条用户消息
+        user_msg = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                user_msg = m.get("content", "")
+                break
+        has_ctx = "阶段产物" in prompt
+        ctx_note = ("我已基于当前项目各阶段产物（结构化原始数据 / 需求规格 / "
+                    "概要设计 / 详细设计 / 测试用例）进行回答。"
+                    if has_ctx else
+                    "当前项目暂无阶段产物，以下为通用回答。")
+        return (
+            f"**【离线演示模式回复】**\n\n{ctx_note}\n\n"
+            f"针对你的问题：「{user_msg[:80]}」\n\n"
+            "这是离线演示模式（`LLM_MOCK=1`）的模拟回复，不会调用真实大模型。\n"
+            "如需真实对话能力，请在 `.env` 中设置 `LLM_MOCK=0` 并配置 "
+            "`LLM_API_KEY`。\n\n"
+            "配置完成后，我可以帮你：\n"
+            "- 提取并汇总需求清单、接口列表、测试用例；\n"
+            "- 对比各阶段产物的一致性与遗漏项；\n"
+            "- 解答软件工程与本项目相关的通用问题。"
+        )
+
     # ---- 阶段1：分块抽取 ----
     if role == "extraction" and "__MAP__" in prompt:
         return json.dumps({

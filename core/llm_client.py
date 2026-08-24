@@ -117,3 +117,49 @@ def chat(messages: list[dict], role: str = "default",
             time.sleep(RETRY_BACKOFF * (2 ** attempt))
 
     raise last_err or LLMError("LLM 调用失败")
+
+
+def chat_stream(messages: list[dict], role: str = "default",
+                temperature: float | None = None):
+    """生成器版本：逐块 yield 增量文本（供 SSE 透传给浏览器）。
+    交互对话场景不做自动重试——失败立即抛 LLMError 让调用方提示用户。"""
+    if llm_mock_enabled():
+        text = mock_complete(messages, role)
+        # 模拟流式：按小块吐出，便于前端呈现打字效果
+        for i in range(0, len(text), 12):
+            yield text[i:i + 12]
+            time.sleep(0.015)
+        return
+
+    cfg = get_llm_config(role)
+    if not cfg["api_key"] or cfg["api_key"].startswith("sk-your"):
+        raise LLMError(
+            "未配置有效的 LLM_API_KEY。请在 .env 中填写真实 key，"
+            "或设置 LLM_MOCK=1 使用离线演示模式。"
+        )
+
+    payload = {
+        "model": cfg["model"],
+        "messages": messages,
+        "temperature": cfg["temperature"] if temperature is None else temperature,
+        "stream": True,
+    }
+    url = cfg["base_url"].rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {cfg['api_key']}",
+        "Content-Type": "application/json",
+    }
+    timeout = httpx.Timeout(connect=CONNECT_TIMEOUT, read=cfg["timeout"],
+                            write=WRITE_TIMEOUT, pool=CONNECT_TIMEOUT)
+
+    with httpx.Client(timeout=timeout) as client:
+        with client.stream("POST", url, json=payload, headers=headers) as resp:
+            if resp.status_code >= 400:
+                body = resp.read().decode("utf-8", "ignore")[:500]
+                raise LLMError(f"LLM 服务返回错误 {resp.status_code}: {body}")
+            got_any = False
+            for piece in _iter_sse_text(resp):
+                got_any = True
+                yield piece
+            if not got_any:
+                raise LLMError("LLM 返回内容为空")

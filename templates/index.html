@@ -11,15 +11,19 @@
 <body>
 <header class="topbar">
   <div class="brand">
+    <button class="btn btn-sm icon-btn" id="btnToggleSidebar" title="收起/展开项目栏">☰</button>
     <span class="brand-icon">⚙️</span>
     <span class="brand-title">多智能体软件开发流水线</span>
   </div>
-  <div class="mock-badge" id="mockBadge" style="display:none">离线演示模式</div>
+  <div class="topbar-right">
+    <div class="mock-badge" id="mockBadge" style="display:none">离线演示模式</div>
+    <button class="btn btn-sm btn-primary" id="btnToggleChat" title="AI 助手：基于当前项目产物对话问答">🤖 AI 助手</button>
+  </div>
 </header>
 
 <div class="layout">
-  <!-- 左侧：项目列表 -->
-  <aside class="sidebar">
+  <!-- 左侧：项目列表（可收起） -->
+  <aside class="sidebar" id="sidebar">
     <div class="sidebar-head">
       <h3>项目</h3>
       <button class="btn btn-primary btn-sm" id="btnNewProject">+ 新建</button>
@@ -110,6 +114,31 @@
       </div>
     </div>
   </main>
+
+  <!-- 右侧：AI 助手（可收起） -->
+  <aside class="chat-panel collapsed" id="chatPanel">
+    <div class="chat-head">
+      <span class="chat-title">🤖 AI 助手</span>
+      <span class="chat-ctx" id="chatCtx" title="对话将以此项目各阶段产物为上下文">未选择项目</span>
+      <button class="btn btn-sm" id="btnChatClear" title="清空当前对话">清空</button>
+      <button class="btn btn-sm" id="btnChatCollapse" title="收起助手">✕</button>
+    </div>
+    <div class="chat-messages" id="chatMessages">
+      <div class="chat-empty">
+        <p>基于当前项目的需求 / 设计 / 测试产物与 AI 对话：</p>
+        <ul>
+          <li>「提取所有功能需求清单」</li>
+          <li>「概要设计和需求有哪些不一致？」</li>
+          <li>「汇总风险项和模糊点」</li>
+        </ul>
+        <p class="hint">切换项目会自动更新上下文；每次对话最多携带最近 6 轮历史。</p>
+      </div>
+    </div>
+    <div class="chat-input-row">
+      <textarea id="chatInput" rows="2" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
+      <button class="btn btn-primary" id="btnChatSend">发送</button>
+    </div>
+  </aside>
 </div>
 
 <!-- 图表放大查看浮层 -->

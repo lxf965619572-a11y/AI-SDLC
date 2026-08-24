@@ -6,6 +6,7 @@ from flask import Flask, render_template
 
 import config
 from db.models import Project, SessionLocal, init_db
+from routes import chat as chat_routes
 from routes import export as export_routes
 from routes import projects as project_routes
 from services import pipeline_service
@@ -37,6 +38,7 @@ def acquire_single_instance_lock() -> bool:
 app = Flask(__name__)
 app.register_blueprint(project_routes.bp)
 app.register_blueprint(export_routes.bp)
+app.register_blueprint(chat_routes.bp)
 
 
 @app.get("/")
