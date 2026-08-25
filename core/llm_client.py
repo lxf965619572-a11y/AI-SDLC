@@ -5,12 +5,19 @@
 流式调用下 token 持续到达，读超时只作用于相邻数据块的间隔，长生成不会被掐断。
 """
 import json
+import os
 import time
 
 import httpx
 
 from config import get_llm_config, llm_mock_enabled
 from core.mock_llm import mock_complete
+
+# LLM 调用是否走系统代理（HTTPS_PROXY 等环境变量控制）。
+# 默认【不走】：LLM 端点通常是直连可达的（如国内阿里云/DeepSeek），若跟随系统
+# 代理，一旦代理软件（梯子/Clash 等）关闭就会报 WinError 10061 连接被拒绝；
+# 确需让 LLM 走代理的环境（如经代理访问 OpenAI）可在 .env 设 LLM_TRUST_PROXY=1。
+LLM_TRUST_PROXY = os.getenv("LLM_TRUST_PROXY", "0") == "1"
 
 MAX_RETRIES = 2            # 首次失败后最多再重试次数
 RETRY_BACKOFF = 5          # 重试退避秒数（按 2 的指数递增）
@@ -86,7 +93,7 @@ def chat(messages: list[dict], role: str = "default",
     last_err: LLMError | None = None
     for attempt in range(MAX_RETRIES + 1):
         try:
-            with httpx.Client(timeout=timeout) as client:
+            with httpx.Client(timeout=timeout, trust_env=LLM_TRUST_PROXY) as client:
                 with client.stream("POST", url, json=payload, headers=headers) as resp:
                     if resp.status_code in RETRYABLE_STATUS:
                         body = resp.read().decode("utf-8", "ignore")[:200]
@@ -152,7 +159,7 @@ def chat_stream(messages: list[dict], role: str = "default",
     timeout = httpx.Timeout(connect=CONNECT_TIMEOUT, read=cfg["timeout"],
                             write=WRITE_TIMEOUT, pool=CONNECT_TIMEOUT)
 
-    with httpx.Client(timeout=timeout) as client:
+    with httpx.Client(timeout=timeout, trust_env=LLM_TRUST_PROXY) as client:
         with client.stream("POST", url, json=payload, headers=headers) as resp:
             if resp.status_code >= 400:
                 body = resp.read().decode("utf-8", "ignore")[:500]
