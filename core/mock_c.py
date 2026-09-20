@@ -240,13 +240,19 @@ static void stock_move(OrderCtx *ctx, const OrderItem *items, size_t n_items,
                        int sign)
 {
     size_t i;
-    int idx;
+    int slot;
 
-    for (i = 0u; i < n_items; i++) {
-        idx = stock_find(ctx, items[i].sku_id);
-        if (idx >= 0) {
-            ctx->stock[idx].qty = (uint32_t)((int64_t)ctx->stock[idx].qty
-                                             + sign * (int64_t)items[i].qty);
+    /* 按库存槽位找条目，而不是按条目找槽位：反过来写就得判「找不到怎么办」，
+       而下单前 stock_check 已经挡掉了目录外商品，那个分支永远走不到——不可达代码
+       的覆盖率天生补不满，留在函数里还会把真实的漏测藏在「反正差一个分支」里。
+       这样写也顺手消掉了 stock_find 返回 -1 时按下标访问数组的风险。 */
+    for (slot = 0; slot < ORDER_STOCK_KINDS; slot++) {
+        for (i = 0u; i < n_items; i++) {
+            if (ctx->stock[slot].sku_id == items[i].sku_id) {
+                ctx->stock[slot].qty =
+                    (uint32_t)((int64_t)ctx->stock[slot].qty
+                               + sign * (int64_t)items[i].qty);
+            }
         }
     }
 }
@@ -548,11 +554,11 @@ int main(void)
              && order_create(&ctx, ORDER_USER_NORMAL, bad, 1u, &od) == ORDER_ERR_ITEMS
              && order_create(&ctx, ORDER_USER_NORMAL, &bad[1], 1u, &od) == ORDER_ERR_ITEMS
              && order_create(&ctx, ORDER_USER_NORMAL, items, 1u, &od) == ORDER_OK
-             && order_pay(&ctx, od.order_no, "") == PAY_BAD_CHANNEL
-             && order_pay(NULL, od.order_no, "alipay") == PAY_ERR_ARG
-             && order_pay(&ctx, NULL, "alipay") == PAY_ERR_ARG
-             && order_pay(&ctx, od.order_no, NULL) == PAY_ERR_ARG
-             && order_pay(&ctx, "WB999999999999", "alipay") == PAY_NOT_FOUND
+             && order_pay(&ctx, od.order_no, "").rc == PAY_BAD_CHANNEL
+             && order_pay(NULL, od.order_no, "alipay").rc == PAY_ERR_ARG
+             && order_pay(&ctx, NULL, "alipay").rc == PAY_ERR_ARG
+             && order_pay(&ctx, od.order_no, NULL).rc == PAY_ERR_ARG
+             && order_pay(&ctx, "WB999999999999", "alipay").rc == PAY_NOT_FOUND
              && ctx.n_orders == 2u,
              "入参防护失效 rc=%d 订单数=%u 期望 2", rc, (unsigned)ctx.n_orders);
 
