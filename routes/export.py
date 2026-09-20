@@ -1,4 +1,4 @@
-"""导出 API：测试用例（Excel / XMind）+ 各阶段文档（Word / Markdown）。"""
+"""导出 API：测试用例（Excel / XMind）+ 各阶段文档（Word / Markdown）+ 需求追溯矩阵。"""
 import re
 
 from flask import Blueprint, jsonify, request, send_file
@@ -8,7 +8,9 @@ from db.models import Project, SessionLocal, StageArtifact
 from exporters.excel_exporter import export_excel
 from exporters.xmind_exporter import export_xmind
 from exporters.docx_exporter import export_docx
+from exporters.trace_exporter import export_trace_excel
 from pipeline.nodes import STAGE_TITLES
+from services.trace_service import build_project_matrix
 
 bp = Blueprint("export", __name__, url_prefix="/api")
 
@@ -88,3 +90,28 @@ def export_stage_doc(pid: int, stage: str):
     path = export_docx(markdown, str(out_dir / f"{name}_{title}.docx"), title=title)
     return send_file(path, as_attachment=True,
                      download_name=f"{name}_{title}.docx")
+
+
+@bp.get("/projects/<int:pid>/export/traceability")
+def export_traceability(pid: int):
+    """导出需求追溯矩阵 Excel：需求 → 概设 → 详设 → 用例 全链路，可作交付件归档。"""
+    fmt = request.args.get("format", "excel").lower()
+    if fmt != "excel":
+        return jsonify({"error": "format 参数目前只支持 excel"}), 400
+
+    with SessionLocal() as session:
+        p = session.get(Project, pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        proj_name, name = p.name, _safe_name(p.name)
+
+    data = build_project_matrix(pid)
+    if not data.get("rows"):
+        return jsonify({"error": "需求产物尚未生成，暂无可导出的追溯矩阵"}), 404
+
+    out_dir = config.OUTPUT_DIR / f"project_{pid}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = export_trace_excel(data, str(out_dir / f"{name}_需求追溯矩阵.xlsx"),
+                              project_name=proj_name)
+    return send_file(path, as_attachment=True,
+                     download_name=f"{name}_需求追溯矩阵.xlsx")

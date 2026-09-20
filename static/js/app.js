@@ -856,13 +856,16 @@ function traceLegacyLinks(s) {
 /* 还没产出的下游环节。链路列不能因为「暂时查不出缺口」就报 ✓ 贯通：
  * 设计文档都还没生成时，贯通是个假结论，必须显示为「待生成」。 */
 function tracePendingStages(s) {
-  return ["hld", "lld", "testcase"]
-    .filter(k => !traceProduced(s, k))
-    .map(k => TRACE_STAGE_LABEL[k]);
+  const keys = Array.isArray(s.pending_links)
+    ? s.pending_links
+    : ["hld", "lld", "testcase"].filter(k => !traceProduced(s, k));
+  return keys.map(k => TRACE_STAGE_LABEL[k] || k);
 }
 
-/* 一条需求缺哪几环：只统计已产出且记录了追溯信息的环节 */
+/* 一条需求缺哪几环：只统计已产出且记录了追溯信息的环节。
+ * 服务端 row.missing 优先（与 Excel 导出共用同一套规则），本地判定仅作兜底。 */
 function traceRowGaps(row, s) {
+  if (Array.isArray(row.missing)) return row.missing;
   const gaps = [];
   if (traceKnown(s, "source") && !(row.sources || []).length) gaps.push("素材来源");
   ["hld", "lld", "testcase"].forEach(k => {
@@ -870,6 +873,25 @@ function traceRowGaps(row, s) {
     if (traceProduced(s, k) && traceKnown(s, k) && !(cell || []).length) gaps.push(TRACE_STAGE_LABEL[k]);
   });
   return gaps;
+}
+
+/* 链路状态：真断链 > 老产物无从判断 > 下游还没产出 > 才算贯通 */
+function traceStatusHtml(r, s, gaps) {
+  const pending = tracePendingStages(s);
+  const st = r.status || (gaps.length ? "gap"
+    : !traceJudgeable(s) ? "unrecorded"
+    : pending.length ? "pending" : "ok");
+  if (st === "gap") {
+    const miss = gaps.length ? gaps : (r.missing || []);
+    return `<span class="trace-bad" title="缺：${escapeHtml(miss.join("、"))}">⚠ 待补</span>`;
+  }
+  if (st === "unrecorded") {
+    return `<span class="trace-unknown" title="产物未记录追溯信息，无从判断">— 未记录</span>`;
+  }
+  if (st === "pending") {
+    return `<span class="trace-pending" title="${escapeHtml(pending.join("、"))}尚未产出，链路还没走完">◷ 待生成</span>`;
+  }
+  return `<span class="trace-ok">✓ 贯通</span>`;
 }
 
 function traceChips(items, emptyText) {
@@ -969,10 +991,6 @@ function renderTrace(data) {
     return;
   }
   const srcIndex = data.sources || {};
-  const judgeable = traceJudgeable(s);
-  const unknownStatus = `<span class="trace-unknown" title="产物未记录追溯信息，无从判断">— 未记录</span>`;
-  const pending = tracePendingStages(s);
-  const pendingStatus = `<span class="trace-pending" title="${escapeHtml(pending.join("、"))}尚未产出，链路还没走完">◷ 待生成</span>`;
   const body = shown.map(r => {
     const gaps = traceRowGaps(r, s);
     const sources = (r.sources || []).map((id, i) => {
@@ -981,12 +999,7 @@ function renderTrace(data) {
       return { text: (r.source_names && r.source_names[i]) || id,
                title: `${id}${chunks ? " · 出处 " + chunks : ""}` };
     });
-    // 优先级：真断链 > 老产物无从判断 > 下游还没产出 > 才算贯通
-    const status = gaps.length
-      ? `<span class="trace-bad" title="缺：${escapeHtml(gaps.join("、"))}">⚠ 待补</span>`
-      : !judgeable ? unknownStatus
-      : pending.length ? pendingStatus
-      : `<span class="trace-ok">✓ 贯通</span>`;
+    const status = traceStatusHtml(r, s, gaps);
     return `<tr class="${gaps.length ? "row-gap" : ""}">
       <td class="tid">${escapeHtml(r.id)}</td>
       <td class="tdesc">${escapeHtml(r.desc || "")}</td>
@@ -1501,6 +1514,12 @@ document.getElementById("btnTraceRefresh").onclick = e => {
   e.stopPropagation();
   traceData = null;
   loadTraceability();
+};
+/* 导出 Excel：服务端直接生成文件，浏览器接管下载 */
+document.getElementById("btnTraceExport").onclick = e => {
+  e.stopPropagation();
+  if (!currentProjectId) return;
+  window.open(`/api/projects/${currentProjectId}/export/traceability?format=excel`, "_blank");
 };
 document.getElementById("traceOnlyGaps").addEventListener("change", e => {
   traceOnlyGaps = e.target.checked;

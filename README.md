@@ -41,6 +41,7 @@
 - 需求元数据里用 `derived_from` 记素材来源，概设 / 详设用 `derived_from` 记「设计元素 → 覆盖的 FR 编号」，用例用 `fr_ids` 记「本用例验证哪些需求」。`GET /api/projects/<id>/traceability` 据此算出每条需求的覆盖情况、未被任何需求引用的孤儿用例、以及未覆盖的 P0 需求。
 - 追溯完整性走 `run_agent(soft_validator=...)`：未达标同样回灌错误让模型修正，但最后一次仍不通过就**接受产物**并把缺口写进 `meta["_warnings"]` 与执行日志，交人工评审裁决，不会因为一个编号没对上就丢掉整份文档。
 - 前端「需求追溯」卡支持「只看待补全」过滤；行状态区分 `✓ 贯通` / `⚠ 待补` / `◷ 待生成`（下游阶段还没产出）/ `— 未记录`（旧格式产物无追溯元数据），不会把「还没生成」误报成「已贯通」。
+- 矩阵可一键导出 Excel（`GET /api/projects/<id>/export/traceability`）：Sheet1 逐条需求展开全链路并按状态着色，Sheet2 是覆盖概览（P0 覆盖率、未覆盖清单、孤儿用例、状态分布）。追溯矩阵在航天 / 军工软件研制里本身就是交付件，导出后可直接归档送审。
 
 ## 快速开始
 
@@ -131,6 +132,7 @@ APP_DEBUG=0        # 共享时务必关闭 debug
 - **需求追溯**：`core/trace.py` 是纯函数（不碰 DB / LLM），各阶段 validator 与前端矩阵共用同一套编号规范与覆盖计算，可离线单测。
 - **抽取缓存隔离**：解析缓存 key 带 flavor（`mock` 或真实模型名）。否则先在离线演示模式跑过的文档，之后切回真实模型会直接命中 mock 那份假数据，产物看着完整其实全是编的。
 - **导出**：openpyxl 生成带格式 Excel；XMind 手工打包 Zen 格式（content.json + zip），不依赖老旧第三方库。
+- **状态判定单点**：行级链路状态（贯通 / 待补全 / 待生成 / 未记录）由 `core/trace.py` 一次算出并随 `/traceability` 下发，前端与 Excel 导出读同一份结果，不会出现「页面上是绿的、导出的表里是黄的」。
 
 ## 目录结构
 
@@ -143,8 +145,8 @@ parsing/            doc_parser / chunker / retriever(BM25) / extractor(map-reduc
 agents/             base_agent(重试校验) / stage_agents(4个智能体)
 pipeline/           state / nodes(解析+智能体+门控) / graph(LangGraph 编排)
 services/           pipeline_service(后台线程执行/恢复) / trace_service(追溯矩阵取数)
-routes/             projects(项目/上传/启动/评审/日志/SSE流/追溯) / export(Excel|XMind)
-exporters/          excel_exporter / xmind_exporter
+routes/             projects(项目/上传/启动/评审/日志/SSE流/追溯) / export(用例|文档|追溯矩阵)
+exporters/          excel_exporter / docx_exporter / xmind_exporter / trace_exporter
 templates/ static/  前端单页（marked + mermaid 本地化渲染；SSE 实时增量 + 变速轮询兜底）
 data/               app.sqlite / checkpoints.sqlite / uploads / outputs / logs
 scripts/            make_sample_prd.py（生成示例 PRD）
@@ -164,6 +166,8 @@ tests/              零依赖测试脚本（run_all.py 一键全跑）
 | GET | /api/projects/&lt;id&gt;/stream?since=N | SSE 实时事件流（思考/增量/进度/落库） |
 | GET | /api/projects/&lt;id&gt;/traceability | 需求追溯矩阵 |
 | GET | /api/projects/&lt;id&gt;/export/testcases?format=excel\|xmind | 导出测试用例 |
+| GET | /api/projects/&lt;id&gt;/stages/&lt;stage&gt;/export?format=docx\|md | 导出阶段文档 |
+| GET | /api/projects/&lt;id&gt;/export/traceability?format=excel | 导出需求追溯矩阵 |
 
 stage 取值：parse / requirement / hld / lld / testcase
 
@@ -181,7 +185,8 @@ stage 取值：parse / requirement / hld / lld / testcase
 | 文件 | 覆盖内容 |
 |---|---|
 | `test_stream_bus.py` | 事件合并阈值、快照重放、resync、started_at、通道换代、工作线程不继承绑定 |
-| `test_trace.py` | 编号规范化、覆盖计算、孤儿用例、recorded 标记 |
+| `test_trace.py` | 编号规范化、覆盖计算、孤儿用例、recorded 标记、行级链路状态 |
+| `test_trace_export.py` | 追溯矩阵导出：写盘后重新打开校验表头、链路状态、P0 覆盖概览 |
 | `test_stage_prompts.py` | 四个智能体的 prompt 约定与 validator（含追溯软校验） |
 | `test_extractor_ids.py` | 素材编号分配、分块来源标记（`D1C12`）与抽取缓存复用 |
 | `test_json_utils.py` | 代码围栏剥离、平衡括号修复等输出清洗 |

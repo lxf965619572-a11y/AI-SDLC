@@ -257,6 +257,13 @@ def build_matrix(srs_meta=None, hld_meta=None, lld_meta=None,
         "has_hld": bool(hld_meta), "has_lld": bool(lld_meta), "has_tc": bool(tc_meta),
         "recorded": recorded_links(srs_meta, hld_meta, lld_meta, tc_meta),
     }
+    # 行级链路状态在这里算一次，前端矩阵与 Excel 导出共用同一套口径，
+    # 避免两边各写一份判定规则、日久漂移。
+    summary["pending_links"] = pending_links(summary)
+    for row in rows:
+        row["missing"] = row_missing(row, summary)
+        row["status"] = status_of(row["missing"], summary)
+        row["status_text"] = status_text_of(row["missing"], summary)
     return {"rows": rows, "summary": summary}
 
 
@@ -276,3 +283,90 @@ def recorded_links(srs_meta=None, hld_meta=None, lld_meta=None,
         "lld": isinstance(lld_meta, dict) and "derived_from" in lld_meta,
         "testcase": any(isinstance(c, dict) and "fr_ids" in c for c in cases),
     }
+
+
+# ---------- 行级链路判定 ----------
+# 「缺口」和「无从判断」必须分开：追溯能力上线前的旧产物没有关联字段，
+# 链路为空是数据缺失而不是设计漏标，混为一谈会让老项目一打开就满屏报红。
+
+LINK_LABELS = {"source": "素材来源", "hld": "概要设计",
+               "lld": "详细设计", "testcase": "测试用例"}
+DOWNSTREAM = ("hld", "lld", "testcase")
+_PRODUCED_FLAG = {"hld": "has_hld", "lld": "has_lld", "testcase": "has_tc"}
+_ROW_CELLS = {"hld": "hld_modules", "lld": "lld_functions", "testcase": "testcases"}
+
+ST_OK = "ok"                    # 链路贯通
+ST_GAP = "gap"                  # 环节已产出且记录过追溯信息，但这条需求是空的
+ST_UNRECORDED = "unrecorded"    # 旧产物没记追溯信息，无从判断
+ST_PENDING = "pending"          # 下游阶段还没产出，链路尚未走完
+
+STATUS_TEXT = {ST_OK: "贯通", ST_GAP: "待补全",
+               ST_UNRECORDED: "未记录", ST_PENDING: "待生成"}
+
+
+def link_produced(summary: dict, link: str) -> bool:
+    """该环节的产物是否已经生成。"""
+    return bool((summary or {}).get(_PRODUCED_FLAG.get(link, "")))
+
+
+def link_recorded(summary: dict, link: str) -> bool:
+    """该环节是否真的记录过追溯信息。缺 recorded 字段时按已记录处理。"""
+    rec = (summary or {}).get("recorded")
+    if not rec:
+        return True
+    return rec.get(link) is not False
+
+
+def pending_links(summary: dict) -> list[str]:
+    """还没产出的下游环节。"""
+    return [k for k in DOWNSTREAM if not link_produced(summary, k)]
+
+
+def judgeable(summary: dict) -> bool:
+    """有没有任何一环是「可判断」的。全片未记录时报贯通是假结论。"""
+    if link_recorded(summary, "source") and (summary or {}).get("fr_total"):
+        return True
+    return any(link_produced(summary, k) and link_recorded(summary, k)
+               for k in DOWNSTREAM)
+
+
+def row_missing(row: dict, summary: dict) -> list[str]:
+    """这条需求缺哪几环：只统计已产出且记录了追溯信息的环节。"""
+    miss = []
+    if link_recorded(summary, "source") and not (row.get("sources") or []):
+        miss.append(LINK_LABELS["source"])
+    for k in DOWNSTREAM:
+        if (link_produced(summary, k) and link_recorded(summary, k)
+                and not (row.get(_ROW_CELLS[k]) or [])):
+            miss.append(LINK_LABELS[k])
+    return miss
+
+
+def status_of(missing: list, summary: dict) -> str:
+    """真断链 > 旧产物无从判断 > 下游还没产出 > 才算贯通。"""
+    if missing:
+        return ST_GAP
+    if not judgeable(summary):
+        return ST_UNRECORDED
+    if pending_links(summary):
+        return ST_PENDING
+    return ST_OK
+
+
+def status_text_of(missing: list, summary: dict) -> str:
+    """导出/展示用的纯文字状态（不带图标），缺口写在后面便于在 Excel 里筛。"""
+    st = status_of(missing, summary)
+    if st == ST_GAP:
+        return f"{STATUS_TEXT[st]}：" + "、".join(missing)
+    if st == ST_PENDING:
+        return (f"{STATUS_TEXT[st]}："
+                + "、".join(LINK_LABELS[k] for k in pending_links(summary)))
+    return STATUS_TEXT[st]
+
+
+def row_status(row: dict, summary: dict) -> str:
+    return status_of(row_missing(row, summary), summary)
+
+
+def row_status_text(row: dict, summary: dict) -> str:
+    return status_text_of(row_missing(row, summary), summary)

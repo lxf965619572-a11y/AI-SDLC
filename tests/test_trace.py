@@ -200,6 +200,74 @@ def test_build_matrix_summary_carries_recorded_flags():
     assert rec["lld"] is False and rec["testcase"] is False
 
 
+# ---------- 行级链路状态 ----------
+
+def test_link_helpers():
+    s = {"has_hld": True, "has_lld": False, "has_tc": False,
+         "recorded": {"source": True, "hld": True, "lld": False, "testcase": False},
+         "fr_total": 2}
+    assert trace.link_produced(s, "hld") and not trace.link_produced(s, "lld")
+    assert trace.link_recorded(s, "hld") and not trace.link_recorded(s, "testcase")
+    assert trace.pending_links(s) == ["lld", "testcase"]
+    assert trace.judgeable(s) is True
+    # 没有 recorded 字段（更早的数据结构）按已记录处理，不能一律判为未记录
+    assert trace.link_recorded({"fr_total": 0}, "source") is True
+
+
+def test_judgeable_false_when_nothing_recorded():
+    s = {"has_hld": False, "has_lld": False, "has_tc": False, "fr_total": 3,
+         "recorded": {"source": False, "hld": False, "lld": False, "testcase": False}}
+    assert trace.judgeable(s) is False
+
+
+def test_row_status_full_chain_is_ok():
+    srs = {"functional_requirements": [
+        {"id": "FR-001", "desc": "x", "priority": "P0", "derived_from": ["OBJ-001"]}]}
+    hld = {"modules": ["comm"], "derived_from": {"comm": ["FR-001"]}}
+    lld = {"derived_from": {"comm_init": ["comm"]}}
+    tc = {"testcases": [{"id": "TC-1", "fr_ids": ["FR-001"]}]}
+    m = trace.build_matrix(srs, hld, lld, tc)
+    row = m["rows"][0]
+    assert row["missing"] == []
+    assert row["status"] == trace.ST_OK and row["status_text"] == "贯通"
+    assert m["summary"]["pending_links"] == []
+
+
+def test_row_status_pending_when_downstream_missing():
+    m = trace.build_matrix(SRS_META, None, None, None)
+    assert m["summary"]["pending_links"] == ["hld", "lld", "testcase"]
+    rows = {r["id"]: r for r in m["rows"]}
+    # 下游都还没产出：不能报「贯通」，那是假结论
+    assert rows["FR-001"]["status"] == trace.ST_PENDING
+    assert rows["FR-001"]["status_text"] == "待生成：概要设计、详细设计、测试用例"
+    # 但真缺口优先于待生成：FR-002 连素材来源都没标注
+    assert rows["FR-002"]["status"] == trace.ST_GAP
+    assert rows["FR-002"]["missing"] == ["素材来源"]
+
+
+def test_row_status_unrecorded_for_legacy_artifacts():
+    # 旧产物：东西在，但没有追溯字段 → 无从判断，既不报贯通也不报断链
+    srs = {"functional_requirements": [{"id": "FR-001", "desc": "x", "priority": "P0"}]}
+    m = trace.build_matrix(srs, {"modules": ["comm"]}, None, None)
+    row = m["rows"][0]
+    assert row["missing"] == []
+    assert row["status"] == trace.ST_UNRECORDED
+    assert row["status_text"] == "未记录"
+
+
+def test_row_status_gap_beats_pending():
+    # 概设已产出且记录过追溯信息，这条需求却没被覆盖：
+    # 即使详设/用例还没生成，也要如实报缺口，不能被「待生成」掩盖
+    srs = {"functional_requirements": [
+        {"id": "FR-001", "desc": "x", "priority": "P0", "derived_from": ["OBJ-001"]}]}
+    hld = {"modules": ["comm"], "derived_from": {"comm": []}}
+    m = trace.build_matrix(srs, hld, None, None)
+    row = m["rows"][0]
+    assert row["status"] == trace.ST_GAP
+    assert row["missing"] == ["概要设计"]
+    assert row["status_text"] == "待补全：概要设计"
+
+
 def _main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
