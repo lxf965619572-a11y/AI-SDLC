@@ -12,3 +12,5 @@ pdfplumber==0.11.4
 jieba==0.42.1
 rank-bm25==0.2.2
 openpyxl==3.1.5
+# 受限 C 子集静态检查：纯 Python 的 C99 AST 解析器（core/c_static.py）
+pycparser==3.0

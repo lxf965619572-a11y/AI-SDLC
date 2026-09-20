@@ -57,6 +57,18 @@ def _overview(wb):
             for r in range(1, ws.max_row + 1) if ws.cell(row=r, column=1).value}
 
 
+def _by_header(wb, sheet="追溯矩阵"):
+    """按表头名取每行的值：矩阵是要加列的，写死列号会让测试变成维护负担。"""
+    ws = wb[sheet]
+    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+    out = {}
+    for r in range(2, ws.max_row + 1):
+        key = ws.cell(row=r, column=1).value
+        out[key] = {h: ws.cell(row=r, column=i + 1).value
+                    for i, h in enumerate(headers)}
+    return out
+
+
 def test_export_writes_two_sheets_with_headers():
     wb, tmp = _export(_matrix())
     try:
@@ -73,17 +85,18 @@ def test_export_writes_two_sheets_with_headers():
 def test_export_rows_carry_chain_and_status():
     wb, tmp = _export(_matrix())
     try:
-        ws = wb["追溯矩阵"]
-        rows = {ws.cell(row=r, column=1).value: [ws.cell(row=r, column=c).value
-                for c in range(1, len(HEADERS) + 1)] for r in (2, 3)}
-        assert rows["FR-001"][3] == "OBJ-001 通信对象"     # 素材编号带上了名称
-        assert rows["FR-001"][4] == "comm"
-        assert rows["FR-001"][5] == "comm_init"
-        assert rows["FR-001"][6] == "TC-1"
-        assert rows["FR-001"][7] == "贯通"
+        rows = _by_header(wb)
+        assert rows["FR-001"]["素材来源"] == "OBJ-001 通信对象"   # 编号带上了名称
+        assert rows["FR-001"]["概要设计"] == "comm"
+        assert rows["FR-001"]["详细设计"] == "comm_init"
+        assert rows["FR-001"]["测试用例"] == "TC-1"
+        assert rows["FR-001"]["链路状态"] == "贯通"
+        # 没跑代码验证闭环：新增四列一律「未产出」，不能凭空编数字
+        for col in ("代码单元", "静态检查", "执行结果", "分支覆盖"):
+            assert rows["FR-001"][col] == "未产出", col
         # FR-002 没被任何用例覆盖：状态必须点名缺哪一环
-        assert rows["FR-002"][6] is None or rows["FR-002"][6] == ""
-        assert rows["FR-002"][7] == "待补全：测试用例"
+        assert not rows["FR-002"]["测试用例"]
+        assert rows["FR-002"]["链路状态"] == "待补全：测试用例"
     finally:
         wb.close()
         shutil.rmtree(tmp, ignore_errors=True)
@@ -110,8 +123,8 @@ def test_export_without_source_names_falls_back_to_ids():
     data = trace.build_matrix(SRS, HLD, LLD, TC)
     wb, tmp = _export(data)
     try:
-        ws = wb["追溯矩阵"]
-        assert ws.cell(row=2, column=4).value == "OBJ-001"
+        rows = _by_header(wb)
+        assert rows["FR-001"]["素材来源"] == "OBJ-001"
     finally:
         wb.close()
         shutil.rmtree(tmp, ignore_errors=True)

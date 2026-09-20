@@ -9,7 +9,7 @@ from flask import (Blueprint, Response, jsonify, request,
 import config
 from core import stream_bus
 from db.models import Document, PipelineLog, Project, SessionLocal, StageArtifact
-from pipeline.nodes import STAGES, STAGE_TITLES
+from pipeline.nodes import DISPLAY_STAGES, STAGE_TITLES
 from services import pipeline_service
 
 bp = Blueprint("projects", __name__, url_prefix="/api")
@@ -19,11 +19,12 @@ ALLOWED_EXT = {".docx", ".pdf", ".md", ".txt"}
 
 @bp.get("/meta")
 def meta():
-    # 阶段定义为前后端单一数据源：后端 STAGES 不含 parse，前端展示需要含 parse 的完整流水线
+    # 阶段定义为前后端单一数据源：DISPLAY_STAGES 按流水线真实顺序给出含 parse 与
+    # 三个工具节点（static/exec/report）的完整链路，前端照此渲染阶段轨。
     from core import web_search
     return jsonify({
         "mock": config.llm_mock_enabled(),
-        "stages": ["parse", *STAGES],
+        "stages": DISPLAY_STAGES,
         "stage_names": STAGE_TITLES,
         # 联网检索配置级开关：未配置 key 时前端不显示「联网」按钮
         "web_search_enabled": web_search.enabled(),
@@ -171,7 +172,7 @@ def status(pid: int):
         if not p:
             return jsonify({"error": "项目不存在"}), 404
         arts = {}
-        for stage in ["parse", *STAGES]:
+        for stage in DISPLAY_STAGES:
             art = (session.query(StageArtifact)
                    .filter_by(project_id=pid, stage=stage)
                    .order_by(StageArtifact.version.desc()).first())
@@ -289,4 +290,4 @@ def stream(pid: int):
                              "Connection": "keep-alive"})
 
 
-STAGE_LABELS = {"parse": STAGE_TITLES["parse"], **{s: STAGE_TITLES[s] for s in STAGES}}
+STAGE_LABELS = {s: STAGE_TITLES[s] for s in DISPLAY_STAGES}

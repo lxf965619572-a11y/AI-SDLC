@@ -102,10 +102,18 @@
 
       <!-- 导出 -->
       <div class="card" id="exportCard" style="display:none">
-        <div class="card-title">测试用例导出</div>
-        <div class="export-row">
+        <div class="card-title">交付件导出</div>
+        <div class="export-row" id="caseExportRow" style="display:none">
+          <span class="export-label">测试用例</span>
           <button class="btn btn-primary" onclick="exportCases('excel')">导出 Excel</button>
           <button class="btn btn-primary" onclick="exportCases('xmind')">导出 XMind</button>
+        </div>
+        <div class="export-row" id="reportExportRow" style="display:none">
+          <span class="export-label">软件测评报告</span>
+          <button class="btn btn-primary" onclick="exportReport('docx')"
+                  title="按 GJB 438B 口径装配的正文，含结论、判据、问题报告单与证据清单">导出 Word</button>
+          <button class="btn btn-primary" onclick="exportReport('xlsx')"
+                  title="报告附表：结论 / 用例 / 覆盖率 / 静态违规 / 问题与偏差 / 证据清单">导出附表 Excel</button>
         </div>
       </div>
 

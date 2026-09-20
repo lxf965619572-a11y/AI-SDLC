@@ -6,7 +6,7 @@
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 
 from db.models import Chunk, Document, Project, SessionLocal, StageArtifact
-from pipeline.nodes import STAGES, STAGE_TITLES
+from pipeline.nodes import DISPLAY_STAGES, STAGE_TITLES
 from core import llm_client, web_search
 from core.llm_client import LLMError
 
@@ -37,7 +37,7 @@ def _build_project_context(pid: int) -> tuple[str, str]:
         p = session.get(Project, pid)
         name = p.name if p else f"项目#{pid}"
         parts = []
-        for stage in ["parse", *STAGES]:
+        for stage in DISPLAY_STAGES:
             art = (session.query(StageArtifact)
                    .filter_by(project_id=pid, stage=stage)
                    .order_by(StageArtifact.version.desc()).first())

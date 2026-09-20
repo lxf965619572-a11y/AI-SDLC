@@ -9,13 +9,16 @@ from exporters.excel_exporter import export_excel
 from exporters.xmind_exporter import export_xmind
 from exporters.docx_exporter import export_docx
 from exporters.trace_exporter import export_trace_excel
+from exporters.report_exporter import export_report_docx, export_report_excel
 from pipeline.nodes import STAGE_TITLES
+from services.report_service import build_report_data
 from services.trace_service import build_project_matrix
 
 bp = Blueprint("export", __name__, url_prefix="/api")
 
 # 支持文档（Word/Markdown）导出的阶段
-DOC_STAGES = ("parse", "requirement", "hld", "lld", "testcase")
+DOC_STAGES = ("parse", "requirement", "hld", "lld", "testcase",
+              "code", "test_impl", "static", "exec", "report")
 
 
 def _safe_name(name: str) -> str:
@@ -115,3 +118,35 @@ def export_traceability(pid: int):
                               project_name=proj_name)
     return send_file(path, as_attachment=True,
                      download_name=f"{name}_需求追溯矩阵.xlsx")
+
+
+@bp.get("/projects/<int:pid>/export/report")
+def export_report(pid: int):
+    """导出软件测评报告（docx / xlsx）。
+
+    数据一律走 report_service.build_report_data，和流水线 report 节点同一套装配，
+    避免导出的报告与前端看到的结论对不上。"""
+    fmt = request.args.get("format", "docx").lower()
+    if fmt not in ("docx", "xlsx"):
+        return jsonify({"error": "format 参数必须为 docx 或 xlsx"}), 400
+
+    with SessionLocal() as session:
+        p = session.get(Project, pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        name = _safe_name(p.name)
+
+    data = build_report_data(pid)
+    arts = data.get("artifacts") or {}
+    if not arts.get("exec") and not arts.get("static"):
+        return jsonify({"error": "测评报告尚未生成：需先完成静态检查或验证执行"}), 404
+
+    out_dir = config.OUTPUT_DIR / f"project_{pid}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if fmt == "xlsx":
+        fname = f"{name}_软件测评报告附表.xlsx"
+        path = export_report_excel(data, str(out_dir / fname))
+    else:
+        fname = f"{name}_软件测评报告.docx"
+        path = export_report_docx(data, str(out_dir / fname))
+    return send_file(path, as_attachment=True, download_name=fname)

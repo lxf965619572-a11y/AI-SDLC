@@ -676,8 +676,14 @@ function stageIndex(s) { return STAGES.indexOf(s); }
 
 function renderExport(st) {
   const card = document.getElementById("exportCard");
-  const tc = st.artifacts["testcase"];
-  card.style.display = tc ? "block" : "none";
+  const a = st.artifacts || {};
+  const hasCase = !!a["testcase"];
+  /* 测评报告要有判据才导出：静态检查或验证执行至少产出过一份，
+   * 否则导出的是一份通篇「未产出」的空报告，那比不导出更容易误导评审。 */
+  const hasReport = !!(a["report"] || a["exec"] || a["static"]);
+  document.getElementById("caseExportRow").style.display = hasCase ? "flex" : "none";
+  document.getElementById("reportExportRow").style.display = hasReport ? "flex" : "none";
+  card.style.display = (hasCase || hasReport) ? "block" : "none";
 }
 
 /* ---------- 产物渲染 ---------- */
@@ -777,10 +783,19 @@ const TRACE_STAGE_LABEL = { hld: "概要设计", lld: "详细设计", testcase: 
 const TRACE_LINK_ARTIFACT = {
   source: "需求规格", hld: "概要设计", lld: "详细设计", testcase: "测试用例",
 };
+/* 执行结果列的取值文字，与 core.trace.EXEC_TEXT / Excel 导出保持同一口径 */
+const TRACE_EXEC_TEXT = {
+  all: "全部通过", partial: "部分失败", none: "全部失败",
+  not_run: "未执行", no_case: "无关联用例",
+};
+const TRACE_NOT_PRODUCED = "未产出";
 
 function traceFingerprintOf(st) {
   const a = st.artifacts || {};
-  return ["requirement", "hld", "lld", "testcase"]
+  /* 验证阶段的产物一落库，矩阵的四列结论就变了：指纹必须带上它们，
+   * 否则 exec 跑完前端还显示旧结论，用户会以为没跑。 */
+  return ["requirement", "hld", "lld", "testcase",
+          "code", "static", "test_impl", "exec"]
     .map(s => `${s}:${a[s] ? a[s].version : "-"}`).join("|");
 }
 
@@ -875,12 +890,19 @@ function traceRowGaps(row, s) {
   return gaps;
 }
 
-/* 链路状态：真断链 > 老产物无从判断 > 下游还没产出 > 才算贯通 */
+/* 链路状态：用例跑挂 > 覆盖不足 > 真断链 > 老产物无从判断 > 下游还没产出 > 才算贯通。
+ * 验证维度的两个状态排在最前：链路缺了只是追溯不全，用例挂了说明实现与需求对不上。 */
 function traceStatusHtml(r, s, gaps) {
   const pending = tracePendingStages(s);
   const st = r.status || (gaps.length ? "gap"
     : !traceJudgeable(s) ? "unrecorded"
     : pending.length ? "pending" : "ok");
+  if (st === "exec_fail") {
+    return `<span class="trace-fail" title="${escapeHtml(r.status_text || "有用例未通过")}">✗ 执行失败</span>`;
+  }
+  if (st === "low_cov") {
+    return `<span class="trace-bad" title="${escapeHtml(r.status_text || "分支覆盖低于门限")}">◐ 覆盖不足</span>`;
+  }
   if (st === "gap") {
     const miss = gaps.length ? gaps : (r.missing || []);
     return `<span class="trace-bad" title="缺：${escapeHtml(miss.join("、"))}">⚠ 待补</span>`;
@@ -901,6 +923,48 @@ function traceChips(items, emptyText) {
     const title = (typeof it === "object" && it.title) ? ` title="${escapeHtml(it.title)}"` : "";
     return `<span class="trace-chip"${title}>${escapeHtml(text)}</span>`;
   }).join("");
+}
+
+/* ---- 验证维度四列的单元格。None 一律是「未产出」，不能显示成 0 或 ✓，
+ * 那等于把「没跑过」说成「跑过了没问题」，在交付件里是硬伤。 ---- */
+function traceCodeCell(r, s) {
+  if (!s.has_code || r.code_units === null || r.code_units === undefined) {
+    return `<span class="trace-none">${TRACE_NOT_PRODUCED}</span>`;
+  }
+  return traceChips(r.code_units, "无对应代码单元");
+}
+
+function traceStaticCell(r, s) {
+  const n = r.static_violations;
+  if (!s.has_static || n === null || n === undefined) {
+    return `<span class="trace-none">${TRACE_NOT_PRODUCED}</span>`;
+  }
+  return n
+    ? `<span class="trace-bad" title="与本需求相关的函数共 ${n} 条违规">⚠ ${n}</span>`
+    : `<span class="trace-ok" title="与本需求相关的函数无违规">✓ 0</span>`;
+}
+
+function traceExecCell(r, s) {
+  const v = r.exec_result;
+  if (!s.has_test_impl || v === null || v === undefined) {
+    return `<span class="trace-none">${TRACE_NOT_PRODUCED}</span>`;
+  }
+  const text = TRACE_EXEC_TEXT[v] || v;
+  const cls = v === "all" ? "trace-ok"
+    : (v === "partial" || v === "none") ? "trace-fail" : "trace-pending";
+  return `<span class="${cls}">${v === "all" ? "✓ " : ""}${escapeHtml(text)}</span>`;
+}
+
+function traceCovCell(r, s) {
+  const cov = r.branch_coverage;
+  if (cov !== null && cov !== undefined) {
+    const min = s.coverage_min;
+    const low = min && cov < min;
+    return `<span class="${low ? "trace-bad" : "trace-ok"}"${
+      low ? ` title="低于门限 ${min}%"` : ""}>${cov.toFixed(1)}%</span>`;
+  }
+  /* 执行跑过了却没有这条需求对应函数的覆盖数据，与压根没执行是两回事 */
+  return `<span class="trace-none">${s.has_exec ? "无数据" : TRACE_NOT_PRODUCED}</span>`;
 }
 
 function traceSummaryHtml(s) {
@@ -926,13 +990,29 @@ function traceSummaryHtml(s) {
   if (traceKnown(s, "testcase") && (s.orphan_testcases || []).length) {
     seg.push(`<span class="ts-item ts-bad" title="没有关联任何需求的测试用例">孤立用例 ${s.orphan_testcases.length}</span>`);
   }
+  /* 验证维度：只在真的产出过对应产物时才说话，否则不提，避免给出假结论 */
+  if (s.has_static) {
+    const n = s.static_unattributed || 0;
+    seg.push(`<span class="ts-item ${n ? "ts-bad" : "ts-ok"}" title="挂不到具体函数的文件级违规">${
+      n ? `静态文件级违规 ${n}` : "静态检查通过"}</span>`);
+  }
+  if (s.has_exec) {
+    const bad = (s.status_counts || {}).exec_fail || 0;
+    const low = (s.status_counts || {}).low_cov || 0;
+    const bits = [];
+    if (bad) bits.push(`执行失败 ${bad}`);
+    if (low) bits.push(`覆盖不足 ${low}`);
+    seg.push(`<span class="ts-item ${bits.length ? "ts-bad" : "ts-ok"}" title="按需求逐行统计的验证结论">${
+      bits.length ? bits.join(" · ") : "验证判据达标"}</span>`);
+  }
   return seg.join("");
 }
 
 function traceVersionsText(versions) {
   const v = versions || {};
   const parts = [];
-  ["requirement", "hld", "lld", "testcase"].forEach(k => {
+  ["requirement", "hld", "lld", "testcase",
+   "code", "static", "test_impl", "exec"].forEach(k => {
     if (v[k]) parts.push(`${STAGE_NAMES[k] || k} v${v[k]}`);
   });
   return parts.join(" · ");
@@ -978,7 +1058,11 @@ function renderTrace(data) {
   renderTraceNotice(s);
   renderTraceGaps(s);
 
-  const shown = traceOnlyGaps ? rows.filter(r => traceRowGaps(r, s).length) : rows;
+  /* 「只看待补全」也要包含验证判据不达标的行：用例跑挂了比文档断链更该被看见 */
+  const shown = traceOnlyGaps
+    ? rows.filter(r => traceRowGaps(r, s).length
+        || r.status === "exec_fail" || r.status === "low_cov")
+    : rows;
   const wrap = document.getElementById("traceTableWrap");
   if (!shown.length) {
     const pending = tracePendingStages(s);
@@ -1000,7 +1084,9 @@ function renderTrace(data) {
                title: `${id}${chunks ? " · 出处 " + chunks : ""}` };
     });
     const status = traceStatusHtml(r, s, gaps);
-    return `<tr class="${gaps.length ? "row-gap" : ""}">
+    const rowCls = r.status === "exec_fail" ? "row-fail"
+      : (r.status === "low_cov" ? "row-warn" : (gaps.length ? "row-gap" : ""));
+    return `<tr class="${rowCls}">
       <td class="tid">${escapeHtml(r.id)}</td>
       <td class="tdesc">${escapeHtml(r.desc || "")}</td>
       <td><span class="pri pri-${escapeHtml(r.priority || "P2")}">${escapeHtml(r.priority || "-")}</span></td>
@@ -1008,13 +1094,22 @@ function renderTrace(data) {
       <td>${traceChips(r.hld_modules, traceProduced(s, "hld") && traceKnown(s, "hld") ? "缺" : "—")}</td>
       <td>${traceChips(r.lld_functions, traceProduced(s, "lld") && traceKnown(s, "lld") ? "缺" : "—")}</td>
       <td>${traceChips(r.testcases, traceProduced(s, "testcase") && traceKnown(s, "testcase") ? "缺" : "—")}</td>
+      <td>${traceCodeCell(r, s)}</td>
+      <td>${traceStaticCell(r, s)}</td>
+      <td>${traceExecCell(r, s)}</td>
+      <td>${traceCovCell(r, s)}</td>
       <td>${status}</td>
     </tr>`;
   }).join("");
   wrap.innerHTML = `<table class="trace-table">
     <thead><tr>
       <th>编号</th><th>需求描述</th><th>优先级</th><th>素材来源</th>
-      <th>概要设计</th><th>详细设计</th><th>测试用例</th><th>链路</th>
+      <th>概要设计</th><th>详细设计</th><th>测试用例</th>
+      <th title="详细设计函数是否已在代码中实现">代码单元</th>
+      <th title="与该需求相关函数的静态检查违规条数">静态检查</th>
+      <th title="该需求关联用例在验证机上的执行结果">执行结果</th>
+      <th title="该需求相关函数中最差的分支覆盖率">分支覆盖</th>
+      <th>链路</th>
     </tr></thead>
     <tbody>${body}</tbody></table>`;
 }
@@ -1347,6 +1442,10 @@ async function resumePipeline() {
 
 function exportCases(fmt) {
   window.open(`/api/projects/${currentProjectId}/export/testcases?format=${fmt}`, "_blank");
+}
+
+function exportReport(fmt) {
+  window.open(`/api/projects/${currentProjectId}/export/report?format=${fmt}`, "_blank");
 }
 
 /* ---------- 新建项目 ---------- */

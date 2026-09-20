@@ -24,6 +24,48 @@ APP_DEBUG = os.getenv("APP_DEBUG", "1") == "1"
 MAP_CONCURRENCY = int(os.getenv("MAP_CONCURRENCY", "8"))
 
 
+# ===== 代码验证执行环境（远端 Linux）=====
+# 为什么编译/运行/覆盖率都不在本机跑：目标平台是 Linux 工具链（gcc + gcov），
+# Windows 上没有可信的 gcov 版本，且航天嵌入式后续要换成 QEMU 目标机模拟。
+# 把「怎么执行」收在 runner 抽象后面，换执行环境只改一处。
+VERIFY_HOST = os.getenv("VERIFY_HOST", "").strip()
+VERIFY_USER = os.getenv("VERIFY_USER", "").strip()
+VERIFY_PORT = int(os.getenv("VERIFY_PORT", "22"))
+# 私钥路径；留空则用 ~/.ssh/id_ed25519_workbuddy_verify（由 scripts/setup_verify_vm.ps1 生成）
+VERIFY_KEY = os.getenv("VERIFY_KEY", "").strip()
+VERIFY_KNOWN_HOSTS = os.getenv("VERIFY_KNOWN_HOSTS", "").strip()
+# 远端工作区根目录（相对 $HOME），实际路径为 ~/<VERIFY_WORKDIR>/p<项目>/v<版本>/
+VERIFY_WORKDIR = os.getenv("VERIFY_WORKDIR", "wb_verify").strip() or "wb_verify"
+VERIFY_TIMEOUT = int(os.getenv("VERIFY_TIMEOUT", "300"))
+# =1 时忽略 VERIFY_HOST，改用本机工具链（Linux/macOS 开发机自测用）
+VERIFY_LOCAL = os.getenv("VERIFY_LOCAL", "0") == "1"
+
+# ===== 验证判据 =====
+# 分支覆盖率门限：低于该值的行在追溯矩阵里标红。0 表示不判覆盖率。
+COVERAGE_BRANCH_MIN = float(os.getenv("COVERAGE_BRANCH_MIN", "80"))
+COVERAGE_LINE_MIN = float(os.getenv("COVERAGE_LINE_MIN", "0"))
+# 圈复杂度上限（静态规则 WB-C-006）
+COMPLEXITY_MAX = int(os.getenv("COMPLEXITY_MAX", "10"))
+# 执行失败 / 必查项违规的最大自动修复轮数，超出即出问题报告单转人工裁决
+MAX_FIX_ROUNDS = int(os.getenv("MAX_FIX_ROUNDS", "2"))
+
+# 验证证据（原始日志、gcov 文本、输入哈希）归档目录
+VERIFY_EVIDENCE_DIR = DATA_DIR / "verify"
+VERIFY_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def verify_key_path() -> str:
+    """验证机私钥路径（未配置时取 setup 脚本的默认位置）。"""
+    if VERIFY_KEY:
+        return VERIFY_KEY.replace("\\", "/")
+    return str(Path.home() / ".ssh" / "id_ed25519_workbuddy_verify").replace("\\", "/")
+
+
+def verify_configured() -> bool:
+    """是否配置了远端验证机。未配置时流水线退化为「只静态检查、不实际执行」。"""
+    return bool(VERIFY_LOCAL or VERIFY_HOST)
+
+
 def _role_env(role: str) -> dict:
     """读取某角色的 LLM 环境变量（未配置返回空）。"""
     prefix = f"LLM_{role.upper()}_"

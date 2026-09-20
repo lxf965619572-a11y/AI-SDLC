@@ -1,7 +1,8 @@
 """需求追溯矩阵导出 Excel（openpyxl）。
 
 矩阵的计算全在 core.trace、取数在 services.trace_service，这里只负责排版：
-Sheet1 按需求逐行展开「素材 → 需求 → 概设 → 详设 → 用例」，Sheet2 是覆盖概览。
+Sheet1 按需求逐行展开「素材 → 需求 → 概设 → 详设 → 用例 → 代码 → 静态 → 执行 → 覆盖」，
+Sheet2 是覆盖概览。
 两张表都是交付件口径，可直接归档或送审。
 """
 from openpyxl import Workbook
@@ -11,23 +12,32 @@ from openpyxl.utils import get_column_letter
 from core import trace
 
 HEADERS = ["需求编号", "优先级", "需求描述", "素材来源",
-           "概要设计", "详细设计", "测试用例", "链路状态"]
-WIDTHS = [11, 8, 46, 30, 24, 30, 26, 30]
+           "概要设计", "详细设计", "测试用例",
+           "代码单元", "静态检查", "执行结果", "分支覆盖", "链路状态"]
+WIDTHS = [11, 8, 46, 30, 24, 30, 26, 26, 12, 12, 10, 30]
 
-# 状态配色：待补全最抢眼；未记录最弱（是数据缺失，不是缺陷）
+# 状态配色：执行失败最抢眼（实现与需求对不上），覆盖不足次之，
+# 待补全再次；未记录最弱（是数据缺失，不是缺陷）。
 STATUS_STYLE = {
+    trace.ST_EXEC_FAIL: ("F8CBAD", "9C0006"),
+    trace.ST_LOW_COV: ("FFE699", "9C5700"),
     trace.ST_GAP: ("FFF2CC", "9C5700"),
     trace.ST_UNRECORDED: ("EDEDED", "6B6B6B"),
     trace.ST_PENDING: ("DEEBF7", "1F4E79"),
     trace.ST_OK: ("E2EFDA", "375623"),
 }
-STATUS_ORDER = (trace.ST_GAP, trace.ST_PENDING, trace.ST_UNRECORDED, trace.ST_OK)
+STATUS_ORDER = (trace.ST_EXEC_FAIL, trace.ST_LOW_COV, trace.ST_GAP,
+                trace.ST_PENDING, trace.ST_UNRECORDED, trace.ST_OK)
 
 HEADER_FILL = PatternFill("solid", fgColor="4472C4")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
 
 STAGE_LABELS = {"requirement": "需求规格", "hld": "概要设计",
-                "lld": "详细设计", "testcase": "测试用例"}
+                "lld": "详细设计", "testcase": "测试用例",
+                "code": "代码实现", "static": "静态检查",
+                "test_impl": "测试实现", "exec": "验证执行"}
+
+NOT_PRODUCED = "未产出"
 
 
 def _sources_text(row: dict) -> str:
@@ -43,6 +53,35 @@ def _sources_text(row: dict) -> str:
     return "\n".join(lines)
 
 
+def _code_cell(row: dict) -> str:
+    units = row.get("code_units")
+    if units is None:
+        return NOT_PRODUCED
+    return "\n".join(units) if units else "无对应代码单元"
+
+
+def _static_cell(row: dict) -> str:
+    n = row.get("static_violations")
+    if n is None:
+        return NOT_PRODUCED
+    return "0 违规" if not n else f"{n} 条违规"
+
+
+def _exec_cell(row: dict) -> str:
+    r = row.get("exec_result")
+    if r is None:
+        return NOT_PRODUCED
+    return trace.EXEC_TEXT.get(r, str(r))
+
+
+def _coverage_cell(row: dict, summary: dict) -> str:
+    cov = row.get("branch_coverage")
+    if cov is not None:
+        return f"{cov:.1f}%"
+    # 执行跑过了却没有这条需求对应函数的覆盖数据，与「压根没执行」是两回事
+    return "无数据" if summary.get("has_exec") else NOT_PRODUCED
+
+
 def _header_row(ws, headers, widths):
     for col, (h, w) in enumerate(zip(headers, widths), 1):
         cell = ws.cell(row=1, column=col, value=h)
@@ -52,10 +91,11 @@ def _header_row(ws, headers, widths):
         ws.column_dimensions[get_column_letter(col)].width = w
 
 
-def _matrix_sheet(wb, rows):
+def _matrix_sheet(wb, rows, summary=None):
     ws = wb.active
     ws.title = "追溯矩阵"
     _header_row(ws, HEADERS, WIDTHS)
+    summary = summary or {}
 
     for r, row in enumerate(rows, 2):
         values = [row.get("id", ""), row.get("priority", ""), row.get("desc", ""),
@@ -63,6 +103,8 @@ def _matrix_sheet(wb, rows):
                   "\n".join(row.get("hld_modules") or []),
                   "\n".join(row.get("lld_functions") or []),
                   "\n".join(row.get("testcases") or []),
+                  _code_cell(row), _static_cell(row), _exec_cell(row),
+                  _coverage_cell(row, summary),
                   row.get("status_text", "")]
         for col, v in enumerate(values, 1):
             cell = ws.cell(row=r, column=col, value=v)
@@ -105,11 +147,17 @@ def _overview_sheet(wb, data, project_name):
                       + (f"（未覆盖：{'、'.join(miss)}）" if miss else "")))
     orphans = summary.get("orphan_testcases") or []
     lines.append(("未关联需求的用例", "、".join(orphans) if orphans else "无"))
+    if summary.get("has_static"):
+        lines.append(("文件级静态违规", summary.get("static_unattributed") or 0))
+    if summary.get("has_exec"):
+        cmin = summary.get("coverage_min")
+        lines.append(("分支覆盖门限", f"{cmin:.0f}%" if cmin else "不判定"))
     lines.append(("链路状态分布", " · ".join(
         f"{trace.STATUS_TEXT.get(k, k)} {status_count[k]}"
         for k in STATUS_ORDER if status_count.get(k)) or "-"))
     lines.append(("说明", "「未记录」表示对应产物生成于追溯能力上线之前，没有关联字段，"
-                        "不计为断链；重跑该阶段即可补全链路。"))
+                        "不计为断链；重跑该阶段即可补全链路。「未产出」表示代码验证"
+                        "闭环尚未跑到该阶段。"))
 
     ws = wb.create_sheet("覆盖概览")
     ws.column_dimensions["A"].width = 22
@@ -129,7 +177,7 @@ def _overview_sheet(wb, data, project_name):
 def export_trace_excel(data: dict, path: str, project_name: str = "") -> str:
     """把 trace_service.build_project_matrix 的结果写成 xlsx，返回文件路径。"""
     wb = Workbook()
-    _matrix_sheet(wb, data.get("rows") or [])
+    _matrix_sheet(wb, data.get("rows") or [], data.get("summary") or {})
     _overview_sheet(wb, data, project_name)
     wb.save(path)
     return path

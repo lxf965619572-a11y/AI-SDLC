@@ -212,8 +212,13 @@ def norm_case_refs(cases) -> list[dict]:
 
 
 def build_matrix(srs_meta=None, hld_meta=None, lld_meta=None,
-                 tc_meta=None) -> dict:
-    """构建需求追溯矩阵：每条 FR 一行，横向串起素材→设计→用例。"""
+                 tc_meta=None, code_meta=None, static_meta=None,
+                 test_impl_meta=None, exec_meta=None, coverage_min=None) -> dict:
+    """构建需求追溯矩阵：每条 FR 一行，横向串起素材→设计→用例→代码→验证结论。
+
+    后四个入参（code/static/test_impl/exec）是代码验证闭环上线后新增的，
+    全部可选：老项目没有这些产物时对应列一律 None，展示为「未产出」，
+    不参与链路缺口判定，也不改变原有四态状态的结论。"""
     frs = collect_frs(srs_meta)
     hld_map = norm_ref_map((hld_meta or {}).get("derived_from"),
                            valid_keys={str(m).strip()
@@ -227,16 +232,60 @@ def build_matrix(srs_meta=None, hld_meta=None, lld_meta=None,
         for fid in c.get("fr_ids", []):
             tc_by_fr.setdefault(fid, []).append(str(c.get("id") or "-"))
 
+    # 代码单元：代码产物里 derived_from 的键就是详细设计函数名，翻成 FR→函数
+    code_by_fr = reverse_index(norm_ref_map((code_meta or {}).get("derived_from"),
+                                            keep_indirect=False)) if code_meta else {}
+    # 用例→需求：测试实现登记的 cases 才是真跑过的那批，设计里的用例可能没落地
+    impl_case_fr: dict[str, list[str]] = {}
+    for c in (test_impl_meta or {}).get("cases") or []:
+        if isinstance(c, dict) and c.get("id"):
+            impl_case_fr[str(c["id"])] = norm_refs(c.get("fr_ids"), "fr")
+    exec_by_id = ((exec_meta or {}).get("tests") or {}).get("by_id") or {}
+    fn_cov = ((exec_meta or {}).get("coverage") or {}).get("function_map") or {}
+    static_funcs = {str(f.get("name")): f
+                    for f in (static_meta or {}).get("functions") or []}
+    static_by_func: dict[str, int] = {}
+    unattributed = 0
+    for v in (static_meta or {}).get("violations") or []:
+        fn = str((v or {}).get("func") or "")
+        if fn:
+            static_by_func[fn] = static_by_func.get(fn, 0) + 1
+        else:
+            unattributed += 1      # 文件级违规挂不到具体需求，只在概览里计数
+
     rows = []
     for fr in frs:
+        fid = fr["id"]
+        units = code_by_fr.get(fid, []) if code_meta else None
+        row_fns = units or lld_by_fr.get(fid, [])
+        exec_result = None
+        if test_impl_meta:
+            mine = [cid for cid, refs in impl_case_fr.items() if fid in refs]
+            if not exec_meta:
+                exec_result = "not_run"
+            elif not mine:
+                exec_result = "no_case"
+            else:
+                sts = [(exec_by_id.get(cid) or {}).get("status") for cid in mine]
+                npass = sum(1 for s in sts if s == "pass")
+                exec_result = ("all" if npass == len(mine)
+                               else "none" if npass == 0 else "partial")
+        covs = [fn_cov[f]["branch_effective"] for f in row_fns
+                if f in fn_cov and fn_cov[f].get("branch_effective") is not None]
         rows.append({
-            "id": fr["id"],
+            "id": fid,
             "desc": fr["desc"],
             "priority": fr["priority"],
             "sources": fr["derived_from"],
-            "hld_modules": hld_by_fr.get(fr["id"], []),
-            "lld_functions": lld_by_fr.get(fr["id"], []),
-            "testcases": tc_by_fr.get(fr["id"], []),
+            "hld_modules": hld_by_fr.get(fid, []),
+            "lld_functions": lld_by_fr.get(fid, []),
+            "testcases": tc_by_fr.get(fid, []),
+            # ---- 代码验证闭环新增四列；None 一律表示「该产物未产出」----
+            "code_units": units,
+            "static_violations": (sum(static_by_func.get(f, 0) for f in row_fns)
+                                  if static_meta else None),
+            "exec_result": exec_result,
+            "branch_coverage": (round(min(covs), 2) if covs else None),
         })
 
     p0 = [f["id"] for f in frs if f["priority"] == "P0"]
@@ -255,6 +304,11 @@ def build_matrix(srs_meta=None, hld_meta=None, lld_meta=None,
         "uncovered_p0": gaps,
         "orphan_testcases": orphan_cases,
         "has_hld": bool(hld_meta), "has_lld": bool(lld_meta), "has_tc": bool(tc_meta),
+        "has_code": bool(code_meta), "has_static": bool(static_meta),
+        "has_test_impl": bool(test_impl_meta), "has_exec": bool(exec_meta),
+        "coverage_min": coverage_min,
+        "static_unattributed": unattributed,
+        "static_functions": len(static_funcs),
         "recorded": recorded_links(srs_meta, hld_meta, lld_meta, tc_meta),
     }
     # 行级链路状态在这里算一次，前端矩阵与 Excel 导出共用同一套口径，
@@ -262,8 +316,12 @@ def build_matrix(srs_meta=None, hld_meta=None, lld_meta=None,
     summary["pending_links"] = pending_links(summary)
     for row in rows:
         row["missing"] = row_missing(row, summary)
-        row["status"] = status_of(row["missing"], summary)
-        row["status_text"] = status_text_of(row["missing"], summary)
+        row["status"] = row_status(row, summary)
+        row["status_text"] = row_status_text(row, summary)
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    summary["status_counts"] = counts
     return {"rows": rows, "summary": summary}
 
 
@@ -299,9 +357,18 @@ ST_OK = "ok"                    # 链路贯通
 ST_GAP = "gap"                  # 环节已产出且记录过追溯信息，但这条需求是空的
 ST_UNRECORDED = "unrecorded"    # 旧产物没记追溯信息，无从判断
 ST_PENDING = "pending"          # 下游阶段还没产出，链路尚未走完
+# 验证维度：用例跑挂了 / 覆盖率没到门限。这两个比文档链路缺口更严重——
+# 链路缺了顶多是追溯不全，用例挂了说明实现与需求对不上，必须排在最前面。
+ST_EXEC_FAIL = "exec_fail"
+ST_LOW_COV = "low_cov"
 
 STATUS_TEXT = {ST_OK: "贯通", ST_GAP: "待补全",
-               ST_UNRECORDED: "未记录", ST_PENDING: "待生成"}
+               ST_UNRECORDED: "未记录", ST_PENDING: "待生成",
+               ST_EXEC_FAIL: "执行失败", ST_LOW_COV: "覆盖不足"}
+
+# 执行结果列的取值与展示文字。None 单独处理为「未产出」。
+EXEC_TEXT = {"all": "全部通过", "partial": "部分失败", "none": "全部失败",
+             "not_run": "未执行", "no_case": "无关联用例"}
 
 
 def link_produced(summary: dict, link: str) -> bool:
@@ -365,8 +432,31 @@ def status_text_of(missing: list, summary: dict) -> str:
 
 
 def row_status(row: dict, summary: dict) -> str:
-    return status_of(row_missing(row, summary), summary)
+    """行状态：执行失败 > 覆盖不足 > 文档链路四态。"""
+    st = exec_status_of(row, summary)
+    return st or status_of(row_missing(row, summary), summary)
 
 
 def row_status_text(row: dict, summary: dict) -> str:
+    st = exec_status_of(row, summary)
+    if st == ST_EXEC_FAIL:
+        detail = EXEC_TEXT.get(row.get("exec_result"), "")
+        return f"{STATUS_TEXT[st]}：{detail}" if detail else STATUS_TEXT[st]
+    if st == ST_LOW_COV:
+        cmin = (summary or {}).get("coverage_min")
+        cov = row.get("branch_coverage")
+        tail = f"（最低分支覆盖 {cov:.1f}%，门限 {cmin:.0f}%）" \
+            if cov is not None and cmin else ""
+        return STATUS_TEXT[st] + tail
     return status_text_of(row_missing(row, summary), summary)
+
+
+def exec_status_of(row: dict, summary: dict) -> str | None:
+    """验证维度的状态；None 表示这一维度还不适用（未产出、未执行或已达标）。"""
+    if (row or {}).get("exec_result") in ("partial", "none"):
+        return ST_EXEC_FAIL
+    cov = (row or {}).get("branch_coverage")
+    cmin = (summary or {}).get("coverage_min")
+    if cov is not None and cmin and cov < float(cmin):
+        return ST_LOW_COV
+    return None

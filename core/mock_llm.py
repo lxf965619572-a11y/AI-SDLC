@@ -4,6 +4,8 @@ import hashlib
 import json
 import re
 
+from core import mock_c
+
 
 def _prompt_of(messages: list[dict]) -> str:
     return "\n".join(m.get("content", "") for m in messages if isinstance(m.get("content"), str))
@@ -19,6 +21,7 @@ _SRC_RE = re.compile(r"\b(?:OBJ|RULE|FLOW)-\d+\b")
 _FR_RE = re.compile(r"\bFR-\d+\b")
 _P0_RE = re.compile(r'"id"\s*:\s*"(FR-\d+)"[^{}]*?"priority"\s*:\s*"P0"')
 _P0_REV_RE = re.compile(r'"priority"\s*:\s*"P0"[^{}]*?"id"\s*:\s*"(FR-\d+)"')
+_TC_LINE_RE = re.compile(r"\bTC[-_\s]?(\d+)\b", re.IGNORECASE)
 
 
 def _uniq(seq) -> list[str]:
@@ -43,6 +46,37 @@ def _fr_ids(prompt: str) -> list[str]:
 
 def _p0_ids(prompt: str) -> list[str]:
     return _uniq(_P0_RE.findall(prompt) + _P0_REV_RE.findall(prompt))
+
+
+def _norm_tc(value: str) -> str:
+    """用例编号归一：TC-1 / tc_001 → TC-001，口径与 verification.parsers 一致。
+
+    测试实现阶段的硬校验拿归一后的编号做集合比较，这里若不归一，
+    设计表里写成 TC-1 就会被判成「用例没落地」。"""
+    m = _TC_LINE_RE.match(str(value or "").strip())
+    return f"TC-{int(m.group(1)):03d}" if m else str(value or "").strip()
+
+
+def _lld_derived(prompt: str) -> dict:
+    """从详细设计的「需求实现对照」表还原 函数名 → 需求编号。
+
+    代码阶段沿用详细设计的分配，而不是按提示词里出现的 FR 顺序重新洗牌：
+    两列各说一套时，追溯矩阵看起来「都有值」，实际却对不上，比空值更难发现。
+
+    只认表格行：元数据 JSON 块在上游就被 split_markdown_and_meta 从正文剥掉了，
+    提示词里带需求编号列的只有这张对照表。"""
+    names = {f["name"] for f in mock_c.ORDER_FUNCTIONS}
+    out: dict[str, list[str]] = {}
+    for line in prompt.splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if not cells or cells[0] not in names:
+            continue
+        frs = _uniq(x for c in cells[1:] for x in _FR_RE.findall(c))
+        if frs:
+            out[cells[0]] = frs
+    return out
 
 
 def _spread(items: list[str], n: int) -> list[list[str]]:
@@ -292,89 +326,72 @@ CREATE TABLE `order` (
 
     # ---- 阶段4：详细设计 ----
     if role == "lld":
-        funcs = ["order_create", "order_pay"]
+        # 函数清单、数据结构、需求分配一律取自 core.mock_c：代码阶段的 mock 产物用的是
+        # 同一份签名与同一张 derived_from 表。两处各写一套时，详细设计与源码会悄悄漂移，
+        # 而漂移要到静态检查 WB-D-001/002（设计覆盖、签名一致）才暴露，代价太高。
+        funcs = mock_c.ORDER_FUNCTIONS
         frs = _fr_ids(prompt)
-        fbuckets = _spread(frs, len(funcs)) if frs else [[] for _ in funcs]
-        trace_rows = "\n".join(f"| {f} | {'、'.join(fbuckets[i]) or '-'} |"
-                               for i, f in enumerate(funcs))
+        fderived = mock_c.derived_from(frs)
+        trace_rows = "\n".join(
+            f"| {f['name']} | {'、'.join(fderived.get(f['name']) or []) or '-'} |"
+            for f in funcs)
+        iface = "\n\n".join(
+            f"### 2.{i + 1} {f['name']}\n- 签名：`{f['sig']}`\n- 说明：{f['desc']}"
+            for i, f in enumerate(funcs))
+        structs = mock_c.struct_block()
         meta = {
-            "data_structures": ["Order", "OrderItem", "InventorySlot", "PayResult"],
-            "functions": [
-                {"name": "order_create", "sig": "int order_create(uint32_t user_id, const OrderItem *items, size_t n_items, Order *out)",
-                 "desc": "创建订单并扣减库存"},
-                {"name": "order_pay", "sig": "PayResult order_pay(const char *order_no, const char *channel)",
-                 "desc": "发起订单支付"},
-            ],
-            "derived_from": {f: fbuckets[i] for i, f in enumerate(funcs)},
+            "data_structures": list(mock_c.ORDER_DATA_STRUCTURES),
+            "functions": [dict(f) for f in funcs],
+            "derived_from": fderived,
         }
         doc = f"""# 详细设计说明书
 
-## 1. 订单模块数据结构设计
+## 1. 订单模块结构与数据结构
+
+模块落成受限 C 子集：对外只有 3 个函数，运行期状态全部收敛在调用方持有的
+`OrderCtx`，库存基线与金卡名单是只读常量表，无动态内存、无递归、无函数指针。
 
 ```mermaid
 flowchart LR
-    subgraph api[api 层]
-        C[order_ctrl.c]
-    end
-    subgraph service[service 层]
-        S[order_svc.c]
-        I[inventory_svc.c]
-    end
-    subgraph data[data 层]
-        R[order_repo.c]
-    end
-    C --> S
-    S --> I
-    S --> R
+    APP[调用方持有 OrderCtx] --> INIT[order_init]
+    APP --> CRT[order_create]
+    APP --> PAY[order_pay]
+    CRT --> CK[create_check 入参/金额/库存校验]
+    CK --> IC[items_check items_amount]
+    CK --> SC[stock_check]
+    CRT --> ML[member_level discount_cent]
+    CRT --> SM[stock_move 扣减库存]
+    PAY --> PF[order_find pay_check]
+    PAY --> SR[stock_restore 超时释放库存]
 ```
 
-关键数据结构：
+关键数据结构（与 `include/order.h` 同源，容量与限额是编译期常量）：
 
 ```c
-typedef struct {{
-    uint32_t sku_id;      /* 商品编号 */
-    uint32_t qty;         /* 数量 */
-    int64_t  price_cent;  /* 单价（分） */
-}} OrderItem;
-
-typedef struct {{
-    char     order_no[33];   /* 订单号，NUL 结尾 */
-    uint32_t user_id;        /* 下单用户 */
-    int64_t  amount_cent;    /* 订单总额（分） */
-    int      status;         /* ORDER_STATUS_* 枚举 */
-    OrderItem items[MAX_ITEMS_PER_ORDER];
-    size_t   n_items;
-}} Order;
+{structs}
 ```
 
 ## 2. 接口定义
 
-### 2.1 order_create
-- 签名：`int order_create(uint32_t user_id, const OrderItem *items, size_t n_items, Order *out)`
-- 说明：校验金额与库存，生成订单号，扣减库存，落库。
-- 返回：0 成功；负值为错误码（`-E_INVENTORY_SHORTAGE` 库存不足；`-E_INVALID_AMOUNT` 金额非法）。
+{iface}
 
-### 2.2 order_pay
-- 签名：`PayResult order_pay(const char *order_no, const char *channel)`
-- 说明：调用支付渠道创建支付单，返回支付凭证。
-
-## 3. 下单核心序列图
+## 3. 下单与支付序列
 
 ```mermaid
 sequenceDiagram
-    participant U as 用户
-    participant C as order_ctrl
-    participant S as order_svc
-    participant I as inventory_svc
-    participant DB as MySQL
-    U->>C: POST /api/orders
-    C->>S: order_create(user_id, items)
-    S->>I: inventory_deduct(sku, qty)
-    I-->>S: 扣减成功
-    S->>DB: order_repo_save(order)
-    DB-->>S: 订单已落库
-    S-->>C: Order
-    C-->>U: 201 订单创建成功
+    participant U as 调用方
+    participant C as order_create
+    participant K as create_check
+    participant P as order_pay
+    U->>C: order_create(ctx, user_id, items, n_items, &out)
+    C->>K: 校验入参/条目/金额上限/库存
+    K-->>C: ORDER_OK
+    C->>C: member_level 与 discount_cent 折算应付金额
+    C->>C: order_no_write 生成订单号，stock_move 扣减库存
+    C-->>U: ORDER_OK，out 为已创建订单
+    U->>P: order_pay(ctx, order_no, channel)
+    P->>P: 超过 30 分钟未支付则取消并 stock_restore 释放库存
+    P-->>U: PayResult(rc, paid_cent, ticket)
 ```
 
 ## 4. 需求实现对照
@@ -420,6 +437,22 @@ sequenceDiagram
              "priority": "P1", "preconditions": "用户为金卡会员",
              "steps": ["购买原价100元商品", "提交订单查看金额"],
              "expected": "订单实付金额为95元"},
+            # 以下两条与 core.mock_c.TEST_ORDER_C 里的 WB_CHECK 一一对应：
+            # 入参防护与状态机/容量边界是把分支覆盖率顶过阈值的必要用例，
+            # 设计里没有它们，测试实现阶段就不允许凭空落地（V 模型：先设计后实现）。
+            {"id": "TC-007", "module": "订单", "title": "非法入参防护", "type": "异常",
+             "priority": "P0", "preconditions": "订单上下文已初始化",
+             "steps": ["分别以空上下文、空条目数组、空出参调用创建订单",
+                       "以条目数 0 与超过容量上限的条目数调用创建订单",
+                       "以数量 0、负单价、目录外商品调用创建订单",
+                       "以空支付渠道、空订单号、不存在的订单号调用支付"],
+             "expected": "全部返回明确的参数/条目/渠道错误码，不生成订单、不扣减库存、不崩溃"},
+            {"id": "TC-008", "module": "订单", "title": "支付状态机与订单表容量边界", "type": "边界",
+             "priority": "P1", "preconditions": "订单上下文已初始化",
+             "steps": ["对同一订单连续支付两次", "推进时刻超过支付超时后再支付",
+                       "对已取消订单再次支付", "连续下单直到订单表写满后再次下单"],
+             "expected": "重复支付返回已支付，超时返回超时并自动取消，取消后返回订单不存在，"
+                         "表满返回表满错误码且已存订单不被破坏"},
         ]
         for i, c in enumerate(cases):
             c["fr_ids"] = [pool[i % len(pool)]] if pool else []
@@ -428,5 +461,29 @@ sequenceDiagram
             if pool[j] not in tgt:
                 tgt.append(pool[j])
         return json.dumps({"testcases": cases}, ensure_ascii=False)
+
+    # ---- 阶段6：代码实现 ----
+    if role == "code":
+        # 产物是固定源码，只有 derived_from 随上游变化：优先沿用详细设计的实现对照表，
+        # 保证追溯矩阵「详细设计」列与「代码单元」列指向同一批需求。
+        return mock_c.code_markdown(_fr_ids(prompt), derived=_lld_derived(prompt))
+
+    # ---- 阶段7：测试实现 ----
+    if role == "test_impl":
+        # 从提示词里的用例设计表逐行还原 {用例编号: [需求编号]}。
+        # 只认表格行：规则说明里也写着 "TC-xxx" 之类的示例，不能当成设计用例。
+        case_frs: dict[str, list[str]] = {}
+        for line in prompt.splitlines():
+            if not line.lstrip().startswith("|"):
+                continue
+            m = _TC_LINE_RE.search(line)
+            if not m:
+                continue
+            case_frs[_norm_tc(m.group(0))] = _uniq(_FR_RE.findall(line))
+        return mock_c.test_impl_markdown(case_frs)
+
+    # ---- 失败归因（仅在一轮验证未通过时被调用）----
+    if role == "attribution":
+        return mock_c.attribution_markdown()
 
     return "OK"

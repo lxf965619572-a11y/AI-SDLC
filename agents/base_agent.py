@@ -13,6 +13,7 @@ class AgentOutputError(Exception):
 
 def run_agent(role: str, system_prompt: str, user_prompt: str,
               validator: Callable[[dict], str | None] | None = None,
+              doc_validator: Callable[[str, dict], str | None] | None = None,
               soft_validator: Callable[[dict], str | None] | None = None,
               expect_json_only: bool = False,
               progress_cb: Callable[[int], None] | None = None) -> tuple[str, dict]:
@@ -22,6 +23,9 @@ def run_agent(role: str, system_prompt: str, user_prompt: str,
       返回 (markdown, meta)。
     - expect_json_only=True：输出为纯 JSON（如测试用例），返回 (markdown="", meta)。
     validator(meta) 返回错误信息字符串表示校验失败，None 表示通过。
+    doc_validator(markdown, meta) 用于「判据不在元数据里、而在正文里」的阶段：
+    代码与测试实现的正文就是源文件本身，硬校验要拿正文抽出文件去远端编译。
+    元数据校验通过后才调用，返回错误同样回灌重试。
     soft_validator(meta) 用于「追溯完整性」这类应当强制、但不值得为它丢弃整份产物的
     指标：未通过时同样回灌错误让模型修正，但最后一次仍不通过就接受输出，
     并把问题写进 meta["_warnings"]，交人工评审裁决。
@@ -54,6 +58,11 @@ def run_agent(role: str, system_prompt: str, user_prompt: str,
             continue
         if validator:
             err = validator(meta)
+            if err:
+                last_err = err
+                continue
+        if doc_validator:
+            err = doc_validator(markdown, meta)
             if err:
                 last_err = err
                 continue
