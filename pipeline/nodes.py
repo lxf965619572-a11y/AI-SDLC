@@ -3,6 +3,7 @@
 import json
 import traceback
 
+from core import stream_bus
 from db.models import (Chunk, Document, PipelineLog, Project, Review,
                        SessionLocal, StageArtifact)
 from pipeline.state import PipelineState
@@ -62,6 +63,7 @@ def parse_input(state: PipelineState) -> dict:
     project_id = state["project_id"]
     with SessionLocal() as session:
         _set_status(session, project_id, "parsing", "parse")
+        stream_bus.publish(project_id, type="stage_start", stage="parse")
         log(session, project_id, "开始解析上传文档", "parse")
         docs = session.query(Document).filter_by(project_id=project_id).all()
         if not docs:
@@ -78,6 +80,7 @@ def parse_input(state: PipelineState) -> dict:
                 paras = parse_document(doc.stored_path, doc.file_type)
                 chunks = chunk_paragraphs(paras)
                 for c in chunks:
+                    c["doc"] = doc.filename   # 供来源标记 D{文档序号}C{段序号} 使用
                     session.add(Chunk(document_id=doc.id, seq=c["seq"],
                                       heading=c["heading"], content=c["content"]))
                 doc.status = "parsed"
@@ -107,6 +110,9 @@ def parse_input(state: PipelineState) -> dict:
             if not cached:
                 live["done"] += 1
             pct = done * 100 // tot
+            # 解析阶段是并发批次抽取，没有可展示的连续文本，只推批次进度
+            stream_bus.publish(project_id, type="progress", stage="parse",
+                               done=done, total=tot, pct=pct, cached=cached)
             # 每推进 5% 或首批完成记一条进度日志（含预计剩余时间）
             if done == 1 or pct >= last_pct["v"] + 5 or done == tot:
                 last_pct["v"] = pct
@@ -120,6 +126,8 @@ def parse_input(state: PipelineState) -> dict:
                     f"LLM 抽取进度：第 {done}/{tot} 批完成（{pct}%）{hit}{eta}", "parse")
 
         def reduce_cb(message: str):
+            stream_bus.publish(project_id, type="progress", stage="parse",
+                               message=f"合并去重：{message}")
             log(session, project_id, f"合并去重：{message}", "parse")
 
         structured = extract_structured(all_chunks, progress_cb=progress_cb,
@@ -127,6 +135,8 @@ def parse_input(state: PipelineState) -> dict:
         md = render_markdown(structured, [d.filename for d in docs if d.status == "parsed"])
         art_id = _save_artifact(session, project_id, "parse", md, structured,
                                 approved_status=True)  # 解析阶段自动通过，无需评审
+        stream_bus.publish(project_id, type="stage_done", stage="parse",
+                           version=1, artifact_id=art_id, chars=len(md))
         log(session, project_id, "结构化抽取完成", "parse")
         return {"structured": structured,
                 "artifacts": {"parse": {"id": art_id, "version": 1}}}
@@ -163,35 +173,47 @@ def make_agent(stage: str):
                         f"「{STAGE_TITLES[stage]}」生成中，已输出约 {chars} 字符", stage)
 
             try:
-                if stage == "requirement":
-                    md, meta = stage_agents.analyze_requirements(
-                        json.dumps(state["structured"], ensure_ascii=False),
-                        retry_comments, prev_md, progress_cb=gen_cb)
-                elif stage == "hld":
-                    srs = _get_approved(session, project_id, "requirement")
-                    md, meta = stage_agents.design_hld(
-                        srs.markdown, srs.meta_json or {}, retry_comments, prev_md,
-                        progress_cb=gen_cb)
-                elif stage == "lld":
-                    hld = _get_approved(session, project_id, "hld")
-                    srs = _get_approved(session, project_id, "requirement")
-                    md, meta = stage_agents.design_lld(
-                        hld.markdown, hld.meta_json or {}, srs.markdown,
-                        retry_comments, prev_md, progress_cb=gen_cb)
-                elif stage == "testcase":
-                    srs = _get_approved(session, project_id, "requirement")
-                    md, meta = stage_agents.generate_testcases(
-                        srs.markdown, srs.meta_json or {}, retry_comments, prev_md,
-                        progress_cb=gen_cb)
-                else:
-                    raise ValueError(f"未知阶段: {stage}")
+                # 绑定流式通道：期间 llm_client 收到的每个增量都会实时推给前端，
+                # 不必等整份文档校验通过并落库
+                with stream_bus.bind(project_id, stage):
+                    if stage == "requirement":
+                        md, meta = stage_agents.analyze_requirements(
+                            json.dumps(state["structured"], ensure_ascii=False),
+                            retry_comments, prev_md, progress_cb=gen_cb)
+                    elif stage == "hld":
+                        srs = _get_approved(session, project_id, "requirement")
+                        md, meta = stage_agents.design_hld(
+                            srs.markdown, srs.meta_json or {}, retry_comments, prev_md,
+                            progress_cb=gen_cb)
+                    elif stage == "lld":
+                        hld = _get_approved(session, project_id, "hld")
+                        srs = _get_approved(session, project_id, "requirement")
+                        md, meta = stage_agents.design_lld(
+                            hld.markdown, hld.meta_json or {}, srs.markdown,
+                            srs.meta_json or {},
+                            retry_comments, prev_md, progress_cb=gen_cb)
+                    elif stage == "testcase":
+                        srs = _get_approved(session, project_id, "requirement")
+                        md, meta = stage_agents.generate_testcases(
+                            srs.markdown, srs.meta_json or {}, retry_comments, prev_md,
+                            progress_cb=gen_cb)
+                    else:
+                        raise ValueError(f"未知阶段: {stage}")
             except Exception as e:
                 log(session, project_id, f"智能体执行失败: {e}\n{traceback.format_exc()}",
                     stage, "ERROR")
+                stream_bus.publish(project_id, type="stage_error", stage=stage,
+                                   message=str(e))
                 raise
 
             art_id = _save_artifact(session, project_id, stage, md, meta)
             version = prev_art.version + 1 if prev_art else 1
+            # 追溯类软校验最终未达标时不丢产物，但要把缺口写进日志交评审裁决
+            for w in (meta or {}).get("_warnings") or []:
+                log(session, project_id, f"追溯校验警告：{w}", stage, "WARN")
+            # 已落库：通知前端丢掉流式缓冲，改从 DB 拉带图表渲染的干净版本
+            stream_bus.publish(project_id, type="stage_done", stage=stage,
+                               version=version, artifact_id=art_id, chars=len(md))
             log(session, project_id, f"「{STAGE_TITLES[stage]}」v{version} 生成完成", stage)
             _set_status(session, project_id, "waiting_review", stage)
             log(session, project_id, f"「{STAGE_TITLES[stage]}」等待人工评审", stage)

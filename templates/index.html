@@ -75,6 +75,7 @@
         <div class="card-title artifact-head">
           <span id="artifactTitle"></span>
           <span class="version-tag" id="artifactVersion"></span>
+          <span class="live-tag" id="liveTag" style="display:none" title="智能体正在生成，内容实时推送">● 实时生成中</span>
           <span class="theme-switch" title="图表风格切换（可随时切换）">
             <button class="btn btn-sm theme-opt" id="btnThemeClassic">经典</button><button class="btn btn-sm theme-opt" id="btnThemeTech">科技感</button>
           </span>
@@ -88,6 +89,7 @@
           <button class="btn btn-sm btn-outline" id="btnReloadPinned" style="display:none"></button>
           <button class="btn btn-sm btn-outline" id="btnReleasePin">跟随当前进度</button>
         </div>
+        <div class="warn-strip" id="artifactWarnings" style="display:none"></div>
         <div class="artifact-body markdown-body" id="artifactBody"></div>
         <div class="review-panel" id="reviewPanel">
           <textarea id="reviewComments" placeholder="评审意见（驳回时必填）"></textarea>
@@ -104,6 +106,27 @@
         <div class="export-row">
           <button class="btn btn-primary" onclick="exportCases('excel')">导出 Excel</button>
           <button class="btn btn-primary" onclick="exportCases('xmind')">导出 XMind</button>
+        </div>
+      </div>
+
+      <!-- 需求追溯矩阵：素材 → 需求 → 概设 → 详设 → 用例 -->
+      <div class="card compact" id="traceCard" style="display:none">
+        <div class="card-title">
+          <span>需求追溯</span>
+          <span class="trace-summary" id="traceSummary"></span>
+          <button class="btn btn-sm btn-outline trace-refresh" id="btnTraceRefresh"
+                  title="按各阶段最新产物重新计算追溯矩阵">↻</button>
+        </div>
+        <div class="collapse-body">
+          <div class="trace-toolbar">
+            <label class="trace-filter" title="只显示设计或用例还没跟上的需求">
+              <input type="checkbox" id="traceOnlyGaps"><span>只看待补全</span>
+            </label>
+            <span class="hint" id="traceHint"></span>
+          </div>
+          <div class="trace-notice" id="traceNotice" style="display:none"></div>
+          <div class="trace-gaps" id="traceGaps" style="display:none"></div>
+          <div class="trace-scroll" id="traceTableWrap"></div>
         </div>
       </div>
 

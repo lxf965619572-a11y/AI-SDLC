@@ -1,10 +1,13 @@
 """项目与流水线相关 API。"""
+import json
 import os
 import uuid
 
-from flask import Blueprint, jsonify, request
+from flask import (Blueprint, Response, jsonify, request,
+                   stream_with_context)
 
 import config
+from core import stream_bus
 from db.models import Document, PipelineLog, Project, SessionLocal, StageArtifact
 from pipeline.nodes import STAGES, STAGE_TITLES
 from services import pipeline_service
@@ -203,6 +206,16 @@ def artifact(pid: int, stage: str):
         })
 
 
+@bp.get("/projects/<int:pid>/traceability")
+def traceability(pid: int):
+    """需求追溯矩阵：每条需求横向串起素材来源、概要/详细设计、测试用例。"""
+    from services import trace_service
+    data = trace_service.build_project_matrix(pid)
+    if not data["rows"]:
+        return jsonify({"error": "暂无需求产物，无法生成追溯矩阵"}), 404
+    return jsonify(data)
+
+
 @bp.post("/projects/<int:pid>/stages/<stage>/review")
 def review(pid: int, stage: str):
     data = request.json or {}
@@ -232,6 +245,48 @@ def logs(pid: int):
             "time": r.created_at.strftime("%H:%M:%S"), "level": r.level,
             "stage": r.stage, "message": r.message,
         } for r in rows])
+
+
+@bp.get("/projects/<int:pid>/stream")
+def stream(pid: int):
+    """SSE：把该项目流水线的实时事件（含智能体逐字输出）推给前端。
+
+    与轮询 /status 的区别：轮询只能看到「已落库的完整产物」，长文档要等几分钟；
+    这里在生成的同时就把增量推出去，前端可以边写边显示。
+    since（或断线重连自动带的 Last-Event-ID）是已收到的最大事件序号，
+    只补发其后的事件，重连不会重复也不会丢字。
+    通道尚未创建时连接会挂住等待并定期发心跳，前端可在点「启动」之前就订阅。"""
+    with SessionLocal() as session:
+        if not session.get(Project, pid):
+            return jsonify({"error": "项目不存在"}), 404
+
+    since = request.args.get("since", default=0, type=int) or 0
+    last_id = request.headers.get("Last-Event-ID")
+    if last_id:
+        try:
+            since = max(since, int(last_id))
+        except ValueError:
+            pass
+
+    def generate():
+        for seq, event in stream_bus.subscribe(pid, since=since):
+            etype = event.get("type")
+            if etype == "heartbeat":
+                yield ": ping\n\n"      # SSE 注释行，防代理/浏览器掐掉空闲连接
+                continue
+            if etype == "closed":
+                yield "data: " + json.dumps({"type": "closed"},
+                                            ensure_ascii=False) + "\n\n"
+                return
+            # 带 id 的帧浏览器会自动记为 Last-Event-ID，重连时原样回传
+            prefix = f"id: {seq}\n" if seq is not None else ""
+            yield prefix + "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+
+    return Response(stream_with_context(generate()),
+                    mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
 
 
 STAGE_LABELS = {"parse": STAGE_TITLES["parse"], **{s: STAGE_TITLES[s] for s in STAGES}}

@@ -443,6 +443,8 @@ function selectProject(pid) {
   if (currentProjectId === pid) return;
   currentProjectId = pid;
   renderToken++;               // 作废所有在途的旧项目异步回包
+  closeLiveStream();           // 旧项目的 SSE 连接与流式缓冲一并作废
+  endLiveStage();
   releasePin();  // 切换项目时释放查看锁定
   currentArtifactStage = null;
   resetDetailUI();             // 立即清空上一个项目的内容区，避免残留
@@ -468,6 +470,15 @@ function resetDetailUI() {
   document.getElementById("btnReloadPinned").style.display = "none";
   document.getElementById("btnCancel").style.display = "none";
   document.getElementById("btnResume").style.display = "none";
+  // 追溯矩阵与产物告警都属于上一个项目，一并清掉
+  document.getElementById("traceCard").style.display = "none";
+  document.getElementById("traceTableWrap").innerHTML = "";
+  document.getElementById("traceSummary").innerHTML = "";
+  document.getElementById("traceGaps").style.display = "none";
+  document.getElementById("traceNotice").style.display = "none";
+  traceFingerprint = "";
+  traceData = null;
+  renderArtifactWarnings(null);
 }
 
 /* ---------- 轮询（按项目状态动态变速 + 标签页隐藏时暂停） ---------- */
@@ -477,6 +488,9 @@ const POLL_IDLE = 15000;     // 待启动/已完成/已失败：几乎不变，�
 
 let pollInterval = POLL_FAST;
 let pollTimer = null;
+/* 侧栏状态徽标只在状态真正变化时重建：轮询每几秒一次，
+ * 无脑重建列表会在用户要点项目时把节点换掉。 */
+const lastStatusByProject = {};
 
 function pollIntervalFor(status) {
   if (status === "running" || status === "parsing") return POLL_FAST;
@@ -521,14 +535,25 @@ async function refreshDetail() {
   const token = renderToken;     // 快照：回包后若项目已切换则整包作废
   const pid = currentProjectId;
   try {
-    const st = await api(`/api/projects/${pid}/status`);
-    if (token !== renderToken || pid !== currentProjectId) return; // 已切换，丢弃旧项目回包
-    pollInterval = pollIntervalFor(st.status);  // 按最新状态调整下一轮轮询间隔
-    renderHeader(st);
+      const st = await api(`/api/projects/${pid}/status`);
+      if (token !== renderToken || pid !== currentProjectId) return; // 已切换，丢弃旧项目回包
+      pollInterval = pollIntervalFor(st.status);  // 按最新状态调整下一轮轮询间隔
+      if (lastStatusByProject[pid] !== st.status) {
+        lastStatusByProject[pid] = st.status;
+        loadProjects().catch(() => {});   // 刷新侧栏「执行中/等待评审/已完成」徽标
+      }
+      renderHeader(st);
     renderDocs(st.documents);
     renderStageTrack(st);
     renderExport(st);
+    syncTraceCard(st);
     renderLogs();
+    // 运行态挂上 SSE 实时流，非运行态关掉连接（不空转）
+    if (st.status === "running" || st.status === "parsing") ensureLiveStream(pid);
+    else closeLiveStream();
+    // 实时生成期间产物卡由增量驱动，轮询到此为止：
+    // 再往下走会用 DB 里的上一版覆盖正在生长的正文
+    if (liveVisible()) return;
     // 用户手动查看（pin）期间：保持显示 pin 的阶段，绝不自动切换
     if (pinnedStage) {
       if (currentArtifactStage !== pinnedStage) await loadArtifact(pinnedStage);
@@ -656,28 +681,38 @@ function renderExport(st) {
 }
 
 /* ---------- 产物渲染 ---------- */
-async function loadArtifact(stage) {
+async function loadArtifact(stage, opts = {}) {
+  // 该阶段正在实时生成：直接接回流式画面，别拿 DB 里的上一版覆盖它
+  if (liveStage === stage) { paintLiveFrame(true); return; }
   currentArtifactStage = stage;
+  const pin = opts.pin !== false;  // 流式收尾时不 pin，好让下一阶段的实时流继续接管
   const token = renderToken;   // 快照：加载期间切换项目则丢弃本次渲染
   const pid = currentProjectId;
   try {
     const art = await api(`/api/projects/${pid}/stages/${stage}/artifact`);
     if (token !== renderToken || pid !== currentProjectId) return; // 已切换，作废
-    pinnedStage = stage;               // 打开产物即锁定，轮询不再自动切走
-    pinnedVersion = art.version;
     const card = document.getElementById("artifactCard");
     card.style.display = "block";
     document.getElementById("artifactTitle").textContent = art.title;
     document.getElementById("artifactVersion").textContent = `v${art.version}`;
-    document.getElementById("pinBar").style.display = "flex";
-    document.getElementById("pinHint").textContent =
-      `正在查看：${STAGE_NAMES[stage] || stage} v${art.version}（已锁定，轮询不会切换）`;
-    document.getElementById("btnReloadPinned").style.display = "none";
-    document.getElementById("btnExportDocx").onclick = () =>
-      window.open(`/api/projects/${pid}/stages/${stage}/export?format=docx`, "_blank");
-    document.getElementById("btnExportMd").onclick = () =>
-      window.open(`/api/projects/${pid}/stages/${stage}/export?format=md`, "_blank");
-    renderMarkdown(art.markdown);
+    const exportBtns = document.querySelector(".export-btns");
+    if (exportBtns) exportBtns.style.visibility = "visible";  // 恢复实时期间隐藏的导出
+    if (pin) {
+      pinnedStage = stage;               // 打开产物即锁定，轮询不再自动切走
+      pinnedVersion = art.version;
+      document.getElementById("pinBar").style.display = "flex";
+      document.getElementById("pinHint").textContent =
+        `正在查看：${STAGE_NAMES[stage] || stage} v${art.version}（已锁定，轮询不会切换）`;
+    } else {
+      releasePin();
+    }
+  document.getElementById("btnReloadPinned").style.display = "none";
+  document.getElementById("btnExportDocx").onclick = () =>
+    window.open(`/api/projects/${pid}/stages/${stage}/export?format=docx`, "_blank");
+  document.getElementById("btnExportMd").onclick = () =>
+    window.open(`/api/projects/${pid}/stages/${stage}/export?format=md`, "_blank");
+  renderArtifactWarnings(art.meta && art.meta._warnings);
+  renderMarkdown(art.markdown);
     // 评审面板仅在等待评审且是当前阶段时显示
     const st = await api(`/api/projects/${pid}/status`);
     if (token !== renderToken || pid !== currentProjectId) return;
@@ -702,6 +737,7 @@ function releasePin() {
 async function followCurrent() {
   releasePin();
   currentArtifactStage = null;
+  if (liveStage) paintLiveFrame(true);   // 有正在生成的阶段：立刻接回实时画面
   await refreshDetail();
 }
 
@@ -726,6 +762,479 @@ async function checkPinnedVersion(st) {
       btn.onclick = reloadPinned;
     }
   }
+}
+
+/* ---------- 需求追溯矩阵 ----------
+ * 数据由后端按各阶段最新产物的元数据实时算出（core/trace 纯函数），前端只做展示。
+ * 轮询很频繁，所以用「产物版本指纹」当缓存键：版本没变就不重复请求。
+ */
+let traceFingerprint = "";   // 当前已渲染矩阵对应的产物版本指纹
+let traceData = null;        // 最近一次矩阵数据（切筛选时重绘用，不必重新请求）
+let traceOnlyGaps = false;   // 「只看待补全」筛选
+
+const TRACE_STAGE_LABEL = { hld: "概要设计", lld: "详细设计", testcase: "测试用例" };
+/* 各追溯环节对应的产物名（提示用户重跑哪个阶段时用人话而不是字段名） */
+const TRACE_LINK_ARTIFACT = {
+  source: "需求规格", hld: "概要设计", lld: "详细设计", testcase: "测试用例",
+};
+
+function traceFingerprintOf(st) {
+  const a = st.artifacts || {};
+  return ["requirement", "hld", "lld", "testcase"]
+    .map(s => `${s}:${a[s] ? a[s].version : "-"}`).join("|");
+}
+
+/* 轮询与切换项目时调用：决定卡片可见性，产物变了才重新计算 */
+function syncTraceCard(st) {
+  const card = document.getElementById("traceCard");
+  if (!st.artifacts || !st.artifacts["requirement"]) {
+    card.style.display = "none";
+    traceFingerprint = "";
+    traceData = null;
+    return;
+  }
+  card.style.display = "block";
+  const fp = traceFingerprintOf(st);
+  if (fp !== traceFingerprint) {
+    traceFingerprint = fp;
+    loadTraceability();
+  }
+}
+
+async function loadTraceability() {
+  if (!currentProjectId) return;
+  const pid = currentProjectId;
+  const fp = traceFingerprint;
+  const wrap = document.getElementById("traceTableWrap");
+  if (!traceData) wrap.innerHTML = '<div class="hint trace-pad">正在计算追溯矩阵…</div>';
+  try {
+    const data = await api(`/api/projects/${pid}/traceability`);
+    if (pid !== currentProjectId || fp !== traceFingerprint) return;  // 已切换或已过期
+    traceData = data;
+    renderTrace(data);
+  } catch (e) {
+    if (pid !== currentProjectId || fp !== traceFingerprint) return;
+    traceData = null;
+    document.getElementById("traceSummary").innerHTML = "";
+    document.getElementById("traceGaps").style.display = "none";
+    document.getElementById("traceNotice").style.display = "none";
+    document.getElementById("traceHint").textContent = "";
+    // 走到这里通常是还没有需求产物：给可操作的提示，而不是每轮轮询弹一次错
+    wrap.innerHTML = `<div class="hint trace-pad">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+/* 该阶段是否已产出产物 */
+function traceProduced(s, k) {
+  return k === "hld" ? !!s.has_hld : (k === "lld" ? !!s.has_lld : !!s.has_tc);
+}
+
+/* 该环节的追溯信息是否被记录过。
+ * 追溯能力上线前生成的旧产物没有这些字段，链路为空属于「无从判断」，
+ * 不能和「新产物里确实漏标」一样报红，否则老项目一打开就是满屏断链。 */
+function traceKnown(s, k) {
+  return !s.recorded || s.recorded[k] !== false;
+}
+
+/* 这个项目有没有任何一环是「可判断」的。老产物整片未记录时，
+ * 链路列不能因为「没查出缺口」就报 ✓ 贯通——那是假结论。 */
+function traceJudgeable(s) {
+  if (traceKnown(s, "source") && (s.fr_total || 0)) return true;
+  return ["hld", "lld", "testcase"].some(k => traceProduced(s, k) && traceKnown(s, k));
+}
+
+/* 产出了但没记录追溯信息的环节（= 需要重跑才能补全链路的旧产物） */
+function traceLegacyLinks(s) {
+  const out = [];
+  if ((s.fr_total || 0) && !traceKnown(s, "source")) out.push("source");
+  ["hld", "lld", "testcase"].forEach(k => {
+    if (traceProduced(s, k) && !traceKnown(s, k)) out.push(k);
+  });
+  return out;
+}
+
+/* 还没产出的下游环节。链路列不能因为「暂时查不出缺口」就报 ✓ 贯通：
+ * 设计文档都还没生成时，贯通是个假结论，必须显示为「待生成」。 */
+function tracePendingStages(s) {
+  return ["hld", "lld", "testcase"]
+    .filter(k => !traceProduced(s, k))
+    .map(k => TRACE_STAGE_LABEL[k]);
+}
+
+/* 一条需求缺哪几环：只统计已产出且记录了追溯信息的环节 */
+function traceRowGaps(row, s) {
+  const gaps = [];
+  if (traceKnown(s, "source") && !(row.sources || []).length) gaps.push("素材来源");
+  ["hld", "lld", "testcase"].forEach(k => {
+    const cell = k === "hld" ? row.hld_modules : (k === "lld" ? row.lld_functions : row.testcases);
+    if (traceProduced(s, k) && traceKnown(s, k) && !(cell || []).length) gaps.push(TRACE_STAGE_LABEL[k]);
+  });
+  return gaps;
+}
+
+function traceChips(items, emptyText) {
+  if (!items || !items.length) return `<span class="trace-none">${emptyText}</span>`;
+  return items.map(it => {
+    const text = typeof it === "string" ? it : (it.text || "");
+    const title = (typeof it === "object" && it.title) ? ` title="${escapeHtml(it.title)}"` : "";
+    return `<span class="trace-chip"${title}>${escapeHtml(text)}</span>`;
+  }).join("");
+}
+
+function traceSummaryHtml(s) {
+  const seg = [`<span class="ts-item">需求 ${s.fr_total || 0}</span>`];
+  if (s.p0_total) seg.push(`<span class="ts-item">P0 ${s.p0_total}</span>`);
+  const gaps = s.uncovered_p0 || {};
+  const miss = [];
+  let judgeable = false;
+  ["hld", "lld", "testcase"].forEach(k => {
+    if (!traceProduced(s, k)) return;
+    if (!traceKnown(s, k)) return;
+    judgeable = true;
+    if ((gaps[k] || []).length) miss.push(`${TRACE_STAGE_LABEL[k]} ${gaps[k].length}`);
+  });
+  if (!judgeable) {
+    seg.push(`<span class="ts-item">${
+      (s.has_hld || s.has_lld || s.has_tc) ? "产物未记录追溯信息" : "设计阶段尚未产出"}</span>`);
+  } else if (miss.length) {
+    seg.push(`<span class="ts-item ts-bad" title="P0 需求还没被覆盖到的环节">P0 待补 ${miss.join(" · ")}</span>`);
+  } else {
+    seg.push(`<span class="ts-item ts-ok">P0 链路完整</span>`);
+  }
+  if (traceKnown(s, "testcase") && (s.orphan_testcases || []).length) {
+    seg.push(`<span class="ts-item ts-bad" title="没有关联任何需求的测试用例">孤立用例 ${s.orphan_testcases.length}</span>`);
+  }
+  return seg.join("");
+}
+
+function traceVersionsText(versions) {
+  const v = versions || {};
+  const parts = [];
+  ["requirement", "hld", "lld", "testcase"].forEach(k => {
+    if (v[k]) parts.push(`${STAGE_NAMES[k] || k} v${v[k]}`);
+  });
+  return parts.join(" · ");
+}
+
+function renderTraceGaps(s) {
+  const box = document.getElementById("traceGaps");
+  const gaps = s.uncovered_p0 || {};
+  const lines = [];
+  ["hld", "lld", "testcase"].forEach(k => {
+    if (!traceKnown(s, k)) return;      // 旧产物无从判断，不列缺口
+    const ids = gaps[k] || [];
+    if (!ids.length) return;
+    lines.push(`<div class="tg-line"><span class="tg-label">${TRACE_STAGE_LABEL[k]}未覆盖的 P0</span>` +
+      ids.map(id => `<span class="trace-chip chip-bad">${escapeHtml(id)}</span>`).join("") + `</div>`);
+  });
+  const orphans = s.orphan_testcases || [];
+  if (orphans.length && traceKnown(s, "testcase")) {
+    lines.push(`<div class="tg-line"><span class="tg-label">未关联需求的用例</span>` +
+      orphans.map(id => `<span class="trace-chip chip-bad">${escapeHtml(id)}</span>`).join("") + `</div>`);
+  }
+  box.innerHTML = lines.join("");
+  box.style.display = lines.length ? "block" : "none";
+}
+
+/* 旧产物提示：说清哪几环是「没记录」而不是「断了」，以及怎么补 */
+function renderTraceNotice(s) {
+  const box = document.getElementById("traceNotice");
+  const legacy = traceLegacyLinks(s);
+  if (!legacy.length) { box.style.display = "none"; box.innerHTML = ""; return; }
+  const names = legacy.map(k => TRACE_LINK_ARTIFACT[k] || k);
+  box.style.display = "block";
+  box.innerHTML = `该项目的「${names.map(escapeHtml).join("、")}」产物生成于追溯能力上线之前，
+    没有记录关联信息，下表中标为 <b>—</b>（无从判断，不计为断链）。重跑对应阶段即可补全链路。`;
+}
+
+function renderTrace(data) {
+  const rows = data.rows || [];
+  const s = data.summary || {};
+  document.getElementById("traceSummary").innerHTML = traceSummaryHtml(s);
+  document.getElementById("traceHint").textContent =
+    `${rows.length} 条需求 · ${traceVersionsText(data.versions)}`;
+  renderTraceNotice(s);
+  renderTraceGaps(s);
+
+  const shown = traceOnlyGaps ? rows.filter(r => traceRowGaps(r, s).length) : rows;
+  const wrap = document.getElementById("traceTableWrap");
+  if (!shown.length) {
+    const pending = tracePendingStages(s);
+    wrap.innerHTML = `<div class="hint trace-pad">${
+      !rows.length
+        ? (!traceJudgeable(s) ? "产物未记录追溯信息，无从判断链路；重跑对应阶段后可见。"
+                              : "需求产物里没有可识别的条目。")
+        : (pending.length ? `${pending.map(escapeHtml).join("、")}尚未产出，暂无已确认的缺口。`
+                          : "没有待补全的需求，链路完整。")}</div>`;
+    return;
+  }
+  const srcIndex = data.sources || {};
+  const judgeable = traceJudgeable(s);
+  const unknownStatus = `<span class="trace-unknown" title="产物未记录追溯信息，无从判断">— 未记录</span>`;
+  const pending = tracePendingStages(s);
+  const pendingStatus = `<span class="trace-pending" title="${escapeHtml(pending.join("、"))}尚未产出，链路还没走完">◷ 待生成</span>`;
+  const body = shown.map(r => {
+    const gaps = traceRowGaps(r, s);
+    const sources = (r.sources || []).map((id, i) => {
+      const info = srcIndex[id] || {};
+      const chunks = (info.chunks || []).join(",");
+      return { text: (r.source_names && r.source_names[i]) || id,
+               title: `${id}${chunks ? " · 出处 " + chunks : ""}` };
+    });
+    // 优先级：真断链 > 老产物无从判断 > 下游还没产出 > 才算贯通
+    const status = gaps.length
+      ? `<span class="trace-bad" title="缺：${escapeHtml(gaps.join("、"))}">⚠ 待补</span>`
+      : !judgeable ? unknownStatus
+      : pending.length ? pendingStatus
+      : `<span class="trace-ok">✓ 贯通</span>`;
+    return `<tr class="${gaps.length ? "row-gap" : ""}">
+      <td class="tid">${escapeHtml(r.id)}</td>
+      <td class="tdesc">${escapeHtml(r.desc || "")}</td>
+      <td><span class="pri pri-${escapeHtml(r.priority || "P2")}">${escapeHtml(r.priority || "-")}</span></td>
+      <td>${traceChips(sources, traceKnown(s, "source") ? "未标注" : "—")}</td>
+      <td>${traceChips(r.hld_modules, traceProduced(s, "hld") && traceKnown(s, "hld") ? "缺" : "—")}</td>
+      <td>${traceChips(r.lld_functions, traceProduced(s, "lld") && traceKnown(s, "lld") ? "缺" : "—")}</td>
+      <td>${traceChips(r.testcases, traceProduced(s, "testcase") && traceKnown(s, "testcase") ? "缺" : "—")}</td>
+      <td>${status}</td>
+    </tr>`;
+  }).join("");
+  wrap.innerHTML = `<table class="trace-table">
+    <thead><tr>
+      <th>编号</th><th>需求描述</th><th>优先级</th><th>素材来源</th>
+      <th>概要设计</th><th>详细设计</th><th>测试用例</th><th>链路</th>
+    </tr></thead>
+    <tbody>${body}</tbody></table>`;
+}
+
+/* 产物元数据里的追溯告警：软校验放行了，但缺口必须让人看见 */
+function renderArtifactWarnings(warnings) {
+  const el = document.getElementById("artifactWarnings");
+  if (!el) return;
+  const list = Array.isArray(warnings) ? warnings.filter(Boolean).map(String) : [];
+  if (!list.length) { el.style.display = "none"; el.innerHTML = ""; return; }
+  el.style.display = "block";
+  el.innerHTML = `<div class="warn-title">⚠ 本版本有 ${list.length} 处追溯缺口（已放行，建议下一版补齐）</div>
+    <ul>${list.map(w => `<li>${escapeHtml(w)}</li>`).join("")}</ul>`;
+}
+
+/* ---------- 实时流式推送（SSE） ----------
+ * 后端 /api/projects/<pid>/stream 在智能体生成的同时逐段推增量，这里把增量拼进
+ * liveBuf 并节流渲染，用户不必等整份文档校验通过、落库才看到内容（长文档要等几分钟）。
+ * SSE 只是「更快看到」的增强通道：连接失败、事件丢失或浏览器不支持时，
+ * 原有轮询仍会在产物落库后渲染出干净版本，不影响正确性。
+ */
+let liveEs = null;             // 当前 EventSource
+let livePid = null;            // 该连接对应的项目（切换项目时据此作废在途事件）
+let liveStage = null;          // 正在实时生成的阶段
+let liveBuf = "";              // 已收到的增量文本；stage_done 后丢弃，改从 DB 拉干净版
+let liveNotes = [];            // 解析阶段的进度行（该阶段没有连续正文可显示）
+let liveProgress = "";         // 解析阶段最新进度描述
+let liveTimer = null;          // 渲染节流定时器
+let liveLastRender = 0;
+const LIVE_RENDER_MS = 150;    // 正文重排最小间隔：marked.parse 长文档并不便宜
+const LIVE_MAX_NOTES = 60;
+let liveThink = "";            // 模型思考增量：推理模型出正文前先思考，长文档这段可达数分钟
+let liveStageStart = 0;        // 本阶段开始时刻，用于显示「思考中 · Ns」
+let liveTick = null;           // 秒级定时器：没有新增量时也要刷新已等待时长
+const LIVE_MAX_THINK = 6000;   // 思考文本只留尾部，避免 DOM 越滚越重
+
+/* 用户 pin 在别的阶段时不打断他的阅读：只在「没 pin」或「pin 的正是本阶段」时接管画面 */
+function liveVisible() {
+  return !!liveStage && (!pinnedStage || pinnedStage === liveStage);
+}
+
+function ensureLiveStream(pid) {
+  if (liveEs && livePid === pid) return;
+  closeLiveStream();
+  if (typeof EventSource === "undefined") return;   // 老浏览器：退回纯轮询
+  livePid = pid;
+  const es = new EventSource(`/api/projects/${pid}/stream?since=0`);
+  liveEs = es;
+  es.onmessage = e => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch (err) { return; }
+    if (livePid !== pid) { try { es.close(); } catch (err) {} return; }
+    handleStreamEvent(ev);
+  };
+  // 断开多因服务端收尾（流水线停到评审门）；真正的重连由 refreshDetail 按状态决定，
+  // 这里不主动重试，避免失败时刷屏式重连
+  es.onerror = () => { if (es.readyState === EventSource.CLOSED) closeLiveStream(); };
+}
+
+function closeLiveStream() {
+  if (liveEs) { try { liveEs.close(); } catch (e) {} }
+  liveEs = null;
+  livePid = null;
+}
+
+function endLiveStage() {
+  liveStage = null;
+  liveBuf = "";
+  liveNotes = [];
+  liveProgress = "";
+  liveThink = "";
+  liveStageStart = 0;
+  if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
+  if (liveTick) { clearInterval(liveTick); liveTick = null; }
+  const tag = document.getElementById("liveTag");
+  if (tag) tag.style.display = "none";
+  const body = document.getElementById("artifactBody");
+  if (body) body.classList.remove("live");
+}
+
+function handleStreamEvent(ev) {
+  switch (ev.type) {
+      case "stage_start":
+        liveStage = ev.stage;
+        liveBuf = "";
+        liveNotes = [];
+        liveProgress = "";
+        liveThink = "";
+        // 用服务端时刻：刷新页面后「思考中 · Ns」仍是从阶段真正开始算的
+        liveStageStart = ev.started_at ? ev.started_at * 1000 : Date.now();
+        startLiveTick();
+        if (liveVisible()) paintLiveFrame(true);
+        break;
+    case "thinking":              // 推理模型出正文前的思考：先把它显示出来，别让用户对着空白等
+      if (ev.stage !== liveStage) break;
+      liveThink = (liveThink + (ev.text || "")).slice(-LIVE_MAX_THINK);
+      scheduleLiveRender();
+      break;
+    case "delta":
+      if (ev.stage !== liveStage) break;
+      liveBuf += ev.text || "";
+      scheduleLiveRender();
+      break;
+    case "reset":                 // 校验/网络重试：上一轮输出作废，前端清空重画
+      if (ev.stage !== liveStage) break;
+      liveBuf = "";
+      liveThink = "";
+      liveStageStart = Date.now();
+      scheduleLiveRender();
+      break;
+      case "resync":                // 断线重连补发的整段快照
+        if (ev.stages && typeof ev.stages[liveStage] === "string") {
+          liveBuf = ev.stages[liveStage];
+          scheduleLiveRender();
+        }
+        if (ev.thinking && typeof ev.thinking[liveStage] === "string") {
+          liveThink = ev.thinking[liveStage].slice(-LIVE_MAX_THINK);
+          scheduleLiveRender();
+        }
+        if (ev.started_at && typeof ev.started_at[liveStage] === "number") {
+          liveStageStart = ev.started_at[liveStage] * 1000;
+        }
+        break;
+    case "progress":
+      if (ev.stage !== liveStage) break;
+      if (ev.total) {
+        liveProgress = `LLM 抽取 ${ev.done}/${ev.total} 批（${ev.pct}%）`;
+        pushLiveNote(liveProgress + (ev.cached ? "（缓存命中）" : ""));
+      } else if (ev.message) {
+        pushLiveNote(ev.message);
+      }
+      scheduleLiveRender();
+      break;
+    case "stage_done":
+      finishLiveStage(ev);
+      break;
+    case "stage_error":
+      endLiveStage();
+      toast(`「${STAGE_NAMES[ev.stage] || ev.stage}」生成失败：${ev.message}`, true);
+      refreshDetail();
+      break;
+    case "run_end":
+      endLiveStage();
+      break;
+    case "closed":                // 服务端本轮结束：关连接，交给轮询
+      endLiveStage();
+      closeLiveStream();
+      refreshDetail();
+      break;
+  }
+}
+
+function pushLiveNote(text) {
+  liveNotes.push(text);
+  if (liveNotes.length > LIVE_MAX_NOTES) liveNotes.shift();
+}
+
+/* 思考期没有增量也要刷新「已等待 Ns」，否则界面看着像卡死 */
+function startLiveTick() {
+  if (liveTick) return;
+  liveTick = setInterval(() => { if (!liveBuf && liveStage) renderLive(); }, 1000);
+}
+
+/* 落库后收尾：流式缓冲是未校验的半成品（末尾还挂着 ```json 元数据块，图表也没渲染），
+ * 换成 DB 里的干净版本；不 pin，好让下一阶段的实时流能继续接管画面。 */
+async function finishLiveStage(ev) {
+  const stage = ev.stage;
+  const wasVisible = liveVisible();
+  endLiveStage();
+  if (wasVisible) await loadArtifact(stage, { pin: false });
+  await refreshDetail();
+}
+
+/* 把产物卡切成「实时生成」形态 */
+function paintLiveFrame(reset) {
+  if (!liveStage) return;
+  const card = document.getElementById("artifactCard");
+  const body = document.getElementById("artifactBody");
+  card.style.display = "block";
+  document.getElementById("artifactTitle").textContent =
+    STAGE_NAMES[liveStage] || liveStage;
+  document.getElementById("artifactVersion").textContent = "生成中";
+  document.getElementById("reviewPanel").style.display = "none";
+  document.getElementById("pinBar").style.display = "none";
+  document.getElementById("btnReloadPinned").style.display = "none";
+  // 产物还没落库，导出按钮此时点了只会 404
+  const exportBtns = document.querySelector(".export-btns");
+  if (exportBtns) exportBtns.style.visibility = "hidden";
+  renderArtifactWarnings(null);   // 上一版的告警不属于正在生成的这一版
+  document.getElementById("liveTag").style.display = "inline-flex";
+  body.classList.add("live");
+  currentArtifactStage = liveStage;
+  if (reset) {
+    body.innerHTML = "";
+    card.scrollIntoView({ behavior: REDUCE_MOTION ? "auto" : "smooth" });
+  }
+  renderLive();
+}
+
+/* 节流渲染：增量到达频率高于人眼需要，合并到固定间隔重排一次 */
+function scheduleLiveRender() {
+  if (liveTimer) return;
+  const wait = Math.max(0, LIVE_RENDER_MS - (performance.now() - liveLastRender));
+  liveTimer = setTimeout(() => {
+    liveTimer = null;
+    liveLastRender = performance.now();
+    renderLive();
+  }, wait);
+}
+
+function renderLive() {
+  if (!liveStage || !liveVisible()) return;
+  const body = document.getElementById("artifactBody");
+  // 替换 innerHTML 前先判断用户是否在底部：正在往上翻阅时不要把他拽回去
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 120;
+  if (liveStage === "parse") {
+    body.innerHTML = (liveNotes.length ? liveNotes : ["正在解析文档并抽取结构化数据…"])
+      .map(n => `<div class="live-note">${escapeHtml(n)}</div>`).join("");
+  } else if (!liveBuf && liveThink) {
+    // 正文还没开始：显示思考流，让用户知道模型在干活而不是卡住了
+    body.innerHTML = `<div class="live-think"><div class="live-think-title">模型思考中</div>` +
+      `<div class="live-think-body">${escapeHtml(liveThink)}</div></div>` +
+      '<span class="chat-cursor"></span>';
+  } else {
+    // 流式期间不跑 mermaid：图表源码先以代码块呈现，stage_done 后统一渲染成 SVG
+    body.innerHTML = marked.parse(liveBuf || "") + '<span class="chat-cursor"></span>';
+  }
+  if (nearBottom) body.scrollTop = body.scrollHeight;
+  document.getElementById("liveTag").textContent = liveStage === "parse"
+    ? `● 实时进度${liveProgress ? "：" + liveProgress : ""}`
+    : (liveBuf
+      ? `● 实时生成中 · ${liveBuf.length.toLocaleString()} 字`
+      : `● 模型思考中 · ${Math.max(0, Math.round((Date.now() - liveStageStart) / 1000))}s`);
 }
 
 /* ---------- 日志 ---------- */
@@ -760,6 +1269,7 @@ async function submitReview(approved) {
     document.getElementById("reviewPanel").style.display = "none";
     releasePin();             // 评审提交后释放锁定，恢复自动跟随
     currentArtifactStage = null;
+    ensureLiveStream(currentProjectId);   // 下一阶段马上开始生成，立即挂上实时流
     refreshDetail();
   } catch (e) {
     toast("提交失败：" + e.message, true);
@@ -788,6 +1298,7 @@ async function startPipeline() {
   try {
     await api(`/api/projects/${currentProjectId}/start`, { method: "POST" });
     toast("流水线已启动");
+    ensureLiveStream(currentProjectId);   // 不等下一轮轮询，立刻开始接收增量
     refreshDetail();
   } catch (e) {
     toast("启动失败：" + e.message, true);
@@ -801,6 +1312,8 @@ async function resetProject() {
     toast("已重置，可重新启动流水线");
     releasePin();
     currentArtifactStage = null;
+    closeLiveStream();
+    endLiveStage();
     document.getElementById("artifactCard").style.display = "none";
     refreshDetail();
   } catch (e) {
@@ -812,6 +1325,7 @@ async function resumePipeline() {
   try {
     await api(`/api/projects/${currentProjectId}/resume`, { method: "POST" });
     toast("已从断点续跑，跳过已完成阶段");
+    ensureLiveStream(currentProjectId);
     refreshDetail();
   } catch (e) {
     toast("断点续跑失败：" + e.message, true);
@@ -978,9 +1492,19 @@ document.getElementById("btnNewProject").onclick = () => {
   document.getElementById("newProjectModal").style.display = "flex";
 };
 /* 上传区 / 阶段进度卡片标题点击折叠展开（省出内容查看空间） */
-["uploadCard", "stageCard"].forEach(id => {
+["uploadCard", "stageCard", "traceCard"].forEach(id => {
   const card = document.getElementById(id);
   if (card) card.querySelector(".card-title").onclick = () => card.classList.toggle("collapsed");
+});
+/* 追溯矩阵：手动重算 + 只看待补全（按钮在标题行内，别顺带触发折叠） */
+document.getElementById("btnTraceRefresh").onclick = e => {
+  e.stopPropagation();
+  traceData = null;
+  loadTraceability();
+};
+document.getElementById("traceOnlyGaps").addEventListener("change", e => {
+  traceOnlyGaps = e.target.checked;
+  if (traceData) renderTrace(traceData);
 });
 document.getElementById("btnCancelNew").onclick = () => {
   document.getElementById("newProjectModal").style.display = "none";

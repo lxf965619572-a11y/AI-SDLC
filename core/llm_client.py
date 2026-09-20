@@ -12,6 +12,7 @@ import httpx
 
 from config import get_llm_config, llm_mock_enabled
 from core.mock_llm import mock_complete
+from core import stream_bus
 
 # LLM 调用是否走系统代理（HTTPS_PROXY 等环境变量控制）。
 # 默认【不走】：LLM 端点通常是直连可达的（如国内阿里云/DeepSeek），若跟随系统
@@ -25,13 +26,22 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 CONNECT_TIMEOUT = 30       # 连接超时
 WRITE_TIMEOUT = 60         # 请求体发送超时
 
+# mock 模式下模拟的「思考」文本：真实推理模型会先发 reasoning_content，
+# 前端要能在思考期就显示点东西，这条链路得能离线验证。
+MOCK_THINKING = ("先梳理输入里的业务对象与约束，再按模板组织章节；"
+                 "重点检查编号是否连续、每条需求是否可验证。")
+
 
 class LLMError(Exception):
     pass
 
 
-def _iter_sse_text(resp):
-    """逐行解析 SSE 流，yield 增量文本片段。"""
+def _iter_sse_pieces(resp):
+    """逐行解析 SSE 流，yield (kind, 增量文本)，kind 为 content 或 reasoning。
+
+    推理模型（如 qwen3.8-max）先长时间只发 reasoning_content 再发 content，
+    长文档这段思考可达数分钟。只取 content 的话，前端在整个思考期都是「0 字」，
+    看着像卡死，所以两种增量都要往上报。"""
     for line in resp.iter_lines():
         if not line or not line.startswith("data:"):
             continue
@@ -46,14 +56,24 @@ def _iter_sse_text(resp):
         if not choices:
             continue
         delta = choices[0].get("delta") or {}
+        think = delta.get("reasoning_content")
+        if think:
+            yield ("reasoning", think)
         piece = delta.get("content")
         if piece:
-            yield piece
+            yield ("content", piece)
         elif not delta:
             # 少数实现不用 delta 而直接在 message 里返回
             msg = choices[0].get("message") or {}
             if msg.get("content"):
-                yield msg["content"]
+                yield ("content", msg["content"])
+
+
+def _iter_sse_text(resp):
+    """只取正文增量（交互对话面板用，思考过程不外显）。"""
+    for kind, text in _iter_sse_pieces(resp):
+        if kind == "content":
+            yield text
 
 
 def chat(messages: list[dict], role: str = "default",
@@ -63,7 +83,7 @@ def chat(messages: list[dict], role: str = "default",
     对超时/网络错误/429/5xx 自动重试；4xx（鉴权、请求非法）立即抛错。
     progress_cb(total_chars)：每收到新增量时回调累计字符数（可为 None）。"""
     if llm_mock_enabled():
-        return mock_complete(messages, role)
+        return _mock_stream(messages, role)
 
     cfg = get_llm_config(role)
     if not cfg["api_key"] or cfg["api_key"].startswith("sk-your"):
@@ -92,6 +112,8 @@ def chat(messages: list[dict], role: str = "default",
 
     last_err: LLMError | None = None
     for attempt in range(MAX_RETRIES + 1):
+        # 每次尝试都从头生成：通知流式总线作废上一轮已推给前端的半截文本
+        stream_bus.reset_attempt()
         try:
             with httpx.Client(timeout=timeout, trust_env=LLM_TRUST_PROXY) as client:
                 with client.stream("POST", url, json=payload, headers=headers) as resp:
@@ -105,9 +127,13 @@ def chat(messages: list[dict], role: str = "default",
                     else:
                         parts = []
                         total = 0
-                        for piece in _iter_sse_text(resp):
+                        for kind, piece in _iter_sse_pieces(resp):
+                            if kind == "reasoning":
+                                stream_bus.publish_thinking(piece)
+                                continue
                             parts.append(piece)
                             total += len(piece)
+                            stream_bus.publish_delta(piece)
                             if progress_cb:
                                 progress_cb(total)
                         text = "".join(parts)
@@ -124,6 +150,19 @@ def chat(messages: list[dict], role: str = "default",
             time.sleep(RETRY_BACKOFF * (2 ** attempt))
 
     raise last_err or LLMError("LLM 调用失败")
+
+
+def _mock_stream(messages: list[dict], role: str) -> str:
+    """离线 mock 也走流式推送：先推一小段思考再按小块喂正文，
+    便于不烧 token 就能验证实时渲染链路（含推理模型思考期的前端表现）。"""
+    text = mock_complete(messages, role)
+    for i in range(0, len(MOCK_THINKING), 16):
+        stream_bus.publish_thinking(MOCK_THINKING[i:i + 16])
+        time.sleep(0.004)
+    for i in range(0, len(text), 24):
+        stream_bus.publish_delta(text[i:i + 24])
+        time.sleep(0.005)
+    return text
 
 
 def chat_stream(messages: list[dict], role: str = "default",

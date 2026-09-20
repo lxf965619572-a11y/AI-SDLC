@@ -18,6 +18,10 @@ server.lock
 # WorkBuddy 项目数据
 .workbuddy/
 
+# Node（frontend/ 是遗留的空脚手架，只有 node_modules 无源码，勿提交）
+frontend/
+node_modules/
+
 # IDE / 编辑器
 .idea/
 .vscode/

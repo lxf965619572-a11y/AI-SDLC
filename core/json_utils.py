@@ -2,14 +2,17 @@
 import json
 import re
 
-_JSON_BLOCK = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
+# 围栏代码块：group(1) = 语言标记（裸围栏时为空），group(2) = 块体。
+# 语言标记必须单独捕获：否则 ```sql / ```c 的标记会被吞进块体，
+# 让非 JSON 代码块混进元数据候选。
+_FENCE_BLOCK = re.compile(r"```([\w+-]*)[ \t\r]*\n?([\s\S]*?)```", re.IGNORECASE)
 
 
 def strip_code_fence(text: str) -> str:
     """去掉 ```json ... ``` 包裹，保留内部内容。"""
-    m = _JSON_BLOCK.search(text)
+    m = _FENCE_BLOCK.search(text)
     if m:
-        return m.group(1).strip()
+        return m.group(2).strip()
     return text.strip()
 
 
@@ -18,8 +21,8 @@ def extract_json(text: str):
     if text is None:
         return None
     candidates = []
-    for m in _JSON_BLOCK.finditer(text):
-        candidates.append(m.group(1))
+    for m in _FENCE_BLOCK.finditer(text):
+        candidates.append(m.group(2))
     candidates.append(text)
     for cand in candidates:
         cand = cand.strip()
@@ -75,17 +78,22 @@ def _balanced_fragment(s: str) -> str | None:
 
 
 def split_markdown_and_meta(text: str) -> tuple[str, dict | None]:
-    """把『Markdown 文档 + 末尾 ```json 元数据块』拆分为 (markdown, meta)。"""
-    blocks = list(_JSON_BLOCK.finditer(text))
-    meta = None
-    if blocks:
-        last = blocks[-1]
-        parsed = _try_parse(last.group(1).strip())
-        if parsed is not None:
-            meta = parsed
-            markdown = text[:last.start()].strip()
-            trailing = text[last.end():].strip()
-            if trailing:
-                markdown += "\n\n" + trailing
-            return markdown, meta
+    """把『Markdown 文档 + ```json 元数据块』拆分为 (markdown, meta)。
+
+    元数据块不要求一定位于文档末尾：概要设计会在其后附 ```sql DDL，
+    详细设计会附 ```c 代码块。因此从后往前扫描，跳过明确标注为其它语言的
+    围栏块，取第一个能解析为 JSON 对象的块作为元数据。
+    找不到时返回 (原文, None)，由调用方触发重试。
+    """
+    for m in reversed(list(_FENCE_BLOCK.finditer(text))):
+        lang = m.group(1).lower()
+        if lang and lang != "json":
+            continue
+        meta = _try_parse(m.group(2).strip())
+        if not isinstance(meta, dict):
+            continue
+        before = text[:m.start()].strip()
+        after = text[m.end():].strip()
+        markdown = f"{before}\n\n{after}" if (before and after) else (before or after)
+        return markdown, meta
     return text.strip(), None

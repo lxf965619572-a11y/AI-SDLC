@@ -13,6 +13,7 @@ class AgentOutputError(Exception):
 
 def run_agent(role: str, system_prompt: str, user_prompt: str,
               validator: Callable[[dict], str | None] | None = None,
+              soft_validator: Callable[[dict], str | None] | None = None,
               expect_json_only: bool = False,
               progress_cb: Callable[[int], None] | None = None) -> tuple[str, dict]:
     """调用 LLM 并校验输出。
@@ -21,6 +22,9 @@ def run_agent(role: str, system_prompt: str, user_prompt: str,
       返回 (markdown, meta)。
     - expect_json_only=True：输出为纯 JSON（如测试用例），返回 (markdown="", meta)。
     validator(meta) 返回错误信息字符串表示校验失败，None 表示通过。
+    soft_validator(meta) 用于「追溯完整性」这类应当强制、但不值得为它丢弃整份产物的
+    指标：未通过时同样回灌错误让模型修正，但最后一次仍不通过就接受输出，
+    并把问题写进 meta["_warnings"]，交人工评审裁决。
     progress_cb(chars)：流式生成进度回调（累计字符数），可为 None。
     校验失败会把错误信息回灌给 LLM 重试，最多 MAX_RETRY 次。
     """
@@ -52,6 +56,14 @@ def run_agent(role: str, system_prompt: str, user_prompt: str,
             err = validator(meta)
             if err:
                 last_err = err
+                continue
+        if soft_validator:
+            err = soft_validator(meta)
+            if err:
+                last_err = err
+                if attempt == MAX_RETRY:
+                    meta.setdefault("_warnings", []).append(err)
+                    return markdown, meta
                 continue
         return markdown, meta
 

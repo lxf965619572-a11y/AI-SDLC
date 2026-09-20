@@ -53,3 +53,13 @@ def get_llm_config(role: str = "default") -> dict:
 
 def llm_mock_enabled() -> bool:
     return os.getenv("LLM_MOCK", "0") == "1"
+
+
+def llm_cache_flavor(role: str = "extraction") -> str:
+    """落盘缓存的来源标识：mock 与各真实模型的抽取结果不能互相复用。
+
+    缓存 key 若只按输入文本哈希，先在 mock 模式跑过一遍的文档，
+    之后切回真实模型会直接命中 mock 那份假数据，产物看着完整其实全是编的。"""
+    if llm_mock_enabled():
+        return "mock"
+    return get_llm_config(role).get("model") or "default"

@@ -13,6 +13,48 @@ def _digest(text: str, n: int = 4) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:n]
 
 
+# ---- 追溯编号提取：让离线演示也能产出完整的可追溯链 ----
+_TAG_RE = re.compile(r"\bD\d+C\d+\b|\bC\d+\b")
+_SRC_RE = re.compile(r"\b(?:OBJ|RULE|FLOW)-\d+\b")
+_FR_RE = re.compile(r"\bFR-\d+\b")
+_P0_RE = re.compile(r'"id"\s*:\s*"(FR-\d+)"[^{}]*?"priority"\s*:\s*"P0"')
+_P0_REV_RE = re.compile(r'"priority"\s*:\s*"P0"[^{}]*?"id"\s*:\s*"(FR-\d+)"')
+
+
+def _uniq(seq) -> list[str]:
+    out = []
+    for x in seq:
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def _tags(prompt: str, limit: int = 3) -> list[str]:
+    return _uniq(_TAG_RE.findall(prompt))[:limit]
+
+
+def _src_ids(prompt: str) -> list[str]:
+    return _uniq(m.group(0) for m in _SRC_RE.finditer(prompt))
+
+
+def _fr_ids(prompt: str) -> list[str]:
+    return _uniq(m.group(0) for m in _FR_RE.finditer(prompt))
+
+
+def _p0_ids(prompt: str) -> list[str]:
+    return _uniq(_P0_RE.findall(prompt) + _P0_REV_RE.findall(prompt))
+
+
+def _spread(items: list[str], n: int) -> list[list[str]]:
+    """把 items 轮流分配到 n 个桶，保证每个 item 至少落一个桶。"""
+    buckets: list[list[str]] = [[] for _ in range(max(n, 1))]
+    for i, it in enumerate(items):
+        b = buckets[i % len(buckets)]
+        if it not in b:
+            b.append(it)
+    return buckets[:n]
+
+
 def mock_complete(messages: list[dict], role: str) -> str:
     prompt = _prompt_of(messages)
 
@@ -43,50 +85,67 @@ def mock_complete(messages: list[dict], role: str) -> str:
 
     # ---- 阶段1：分块抽取 ----
     if role == "extraction" and "__MAP__" in prompt:
+        src = _tags(prompt)
         return json.dumps({
             "objects": [
                 {"name": "订单", "attrs": ["订单编号", "客户", "商品明细", "金额", "状态"],
-                 "desc": "客户下单后生成的交易单据"},
+                 "desc": "客户下单后生成的交易单据", "source": src},
                 {"name": "用户", "attrs": ["用户ID", "姓名", "手机号", "会员等级"],
-                 "desc": "系统中的注册用户"},
+                 "desc": "系统中的注册用户", "source": src},
             ],
             "rules": [
-                {"name": "订单金额校验", "desc": "订单金额必须大于0且不超过50000元"},
-                {"name": "库存扣减", "desc": "下单成功后立即扣减库存，支付超时30分钟自动释放"},
+                {"name": "订单金额校验", "desc": "订单金额必须大于0且不超过50000元",
+                 "source": src},
+                {"name": "库存扣减", "desc": "下单成功后立即扣减库存，支付超时30分钟自动释放",
+                 "source": src},
             ],
             "flows": [
-                {"name": "下单流程", "steps": ["选择商品", "确认订单", "提交订单", "支付", "支付成功通知"]},
+                {"name": "下单流程", "steps": ["选择商品", "确认订单", "提交订单", "支付", "支付成功通知"],
+                 "source": src},
             ],
         }, ensure_ascii=False)
 
     if role == "extraction":  # reduce
+        src = _tags(prompt)
         return json.dumps({
             "objects": [
                 {"name": "订单", "attrs": ["订单编号", "客户", "商品明细", "金额", "状态"],
-                 "desc": "客户下单后生成的交易单据"},
+                 "desc": "客户下单后生成的交易单据", "source": src},
                 {"name": "用户", "attrs": ["用户ID", "姓名", "手机号", "会员等级"],
-                 "desc": "系统中的注册用户"},
-                {"name": "商品", "attrs": ["SKU", "名称", "价格", "库存"], "desc": "可售商品"},
+                 "desc": "系统中的注册用户", "source": src},
+                {"name": "商品", "attrs": ["SKU", "名称", "价格", "库存"], "desc": "可售商品",
+                 "source": src},
             ],
             "rules": [
-                {"name": "订单金额校验", "desc": "订单金额必须大于0且不超过50000元"},
-                {"name": "库存扣减", "desc": "下单成功后立即扣减库存，支付超时30分钟自动释放"},
-                {"name": "会员折扣", "desc": "金卡会员享受95折，银卡会员享受98折"},
+                {"name": "订单金额校验", "desc": "订单金额必须大于0且不超过50000元",
+                 "source": src},
+                {"name": "库存扣减", "desc": "下单成功后立即扣减库存，支付超时30分钟自动释放",
+                 "source": src},
+                {"name": "会员折扣", "desc": "金卡会员享受95折，银卡会员享受98折",
+                 "source": src},
             ],
             "flows": [
-                {"name": "下单流程", "steps": ["选择商品", "确认订单", "提交订单", "支付", "支付成功通知"]},
-                {"name": "退款流程", "steps": ["发起退款申请", "客服审核", "原路退回", "通知用户"]},
+                {"name": "下单流程", "steps": ["选择商品", "确认订单", "提交订单", "支付", "支付成功通知"],
+                 "source": src},
+                {"name": "退款流程", "steps": ["发起退款申请", "客服审核", "原路退回", "通知用户"],
+                 "source": src},
             ],
         }, ensure_ascii=False)
 
     # ---- 阶段2：需求分析 ----
     if role == "requirement":
+        srcs = _src_ids(prompt)
+        fr_src = _spread(srcs, 4) if srcs else [[] for _ in range(4)]
         meta = {
             "functional_requirements": [
-                {"id": "FR-001", "desc": "用户可以注册并登录系统", "priority": "P0"},
-                {"id": "FR-002", "desc": "用户可以浏览商品并加入购物车", "priority": "P0"},
-                {"id": "FR-003", "desc": "用户可以提交订单并完成支付", "priority": "P0"},
-                {"id": "FR-004", "desc": "用户可以发起退款申请", "priority": "P1"},
+                {"id": "FR-001", "desc": "用户可以注册并登录系统", "priority": "P0",
+                 "derived_from": fr_src[0]},
+                {"id": "FR-002", "desc": "用户可以浏览商品并加入购物车", "priority": "P0",
+                 "derived_from": fr_src[1]},
+                {"id": "FR-003", "desc": "用户可以提交订单并完成支付", "priority": "P0",
+                 "derived_from": fr_src[2]},
+                {"id": "FR-004", "desc": "用户可以发起退款申请", "priority": "P1",
+                 "derived_from": fr_src[3]},
             ],
             "ambiguities": [
                 {"id": "AMB-001", "desc": "PRD未明确并发下单时库存超卖的处理策略", "severity": "高"},
@@ -102,12 +161,12 @@ def mock_complete(messages: list[dict], role: str) -> str:
 
 ## 2. 功能需求清单
 
-| 编号 | 需求描述 | 优先级 |
-|---|---|---|
-| FR-001 | 用户可以注册并登录系统 | P0 |
-| FR-002 | 用户可以浏览商品并加入购物车 | P0 |
-| FR-003 | 用户可以提交订单并完成支付 | P0 |
-| FR-004 | 用户可以发起退款申请 | P1 |
+| 编号 | 需求描述 | 优先级 | 来源编号 |
+|---|---|---|---|
+| FR-001 | 用户可以注册并登录系统 | P0 | {"、".join(fr_src[0]) or "-"} |
+| FR-002 | 用户可以浏览商品并加入购物车 | P0 | {"、".join(fr_src[1]) or "-"} |
+| FR-003 | 用户可以提交订单并完成支付 | P0 | {"、".join(fr_src[2]) or "-"} |
+| FR-004 | 用户可以发起退款申请 | P1 | {"、".join(fr_src[3]) or "-"} |
 
 ## 3. 用户故事
 
@@ -135,14 +194,20 @@ def mock_complete(messages: list[dict], role: str) -> str:
 
     # ---- 阶段3：概要设计 ----
     if role == "hld":
+        modules = ["用户模块", "商品模块", "订单模块", "支付模块"]
+        frs = _fr_ids(prompt)
+        buckets = _spread(frs, len(modules)) if frs else [[] for _ in modules]
+        accept_rows = "\n".join(f"| {m} | {'、'.join(buckets[i]) or '-'} |"
+                                for i, m in enumerate(modules))
         meta = {
-            "modules": ["用户模块", "商品模块", "订单模块", "支付模块"],
+            "modules": modules,
             "tables": ["user", "product", "order", "order_item", "payment"],
             "apis": [
                 {"method": "POST", "path": "/api/auth/register", "desc": "用户注册"},
                 {"method": "POST", "path": "/api/orders", "desc": "创建订单"},
                 {"method": "GET", "path": "/api/products", "desc": "商品列表"},
             ],
+            "derived_from": {m: buckets[i] for i, m in enumerate(modules)},
         }
         doc = f"""# 概要设计说明书
 
@@ -213,6 +278,12 @@ CREATE TABLE `order` (
 | POST | /api/orders | 创建订单 |
 | GET | /api/products | 商品列表 |
 
+## 6. 需求承接
+
+| 模块 | 承接需求 |
+|---|---|
+{accept_rows}
+
 ```json
 {json.dumps(meta, ensure_ascii=False)}
 ```
@@ -221,6 +292,11 @@ CREATE TABLE `order` (
 
     # ---- 阶段4：详细设计 ----
     if role == "lld":
+        funcs = ["order_create", "order_pay"]
+        frs = _fr_ids(prompt)
+        fbuckets = _spread(frs, len(funcs)) if frs else [[] for _ in funcs]
+        trace_rows = "\n".join(f"| {f} | {'、'.join(fbuckets[i]) or '-'} |"
+                               for i, f in enumerate(funcs))
         meta = {
             "data_structures": ["Order", "OrderItem", "InventorySlot", "PayResult"],
             "functions": [
@@ -229,6 +305,7 @@ CREATE TABLE `order` (
                 {"name": "order_pay", "sig": "PayResult order_pay(const char *order_no, const char *channel)",
                  "desc": "发起订单支付"},
             ],
+            "derived_from": {f: fbuckets[i] for i, f in enumerate(funcs)},
         }
         doc = f"""# 详细设计说明书
 
@@ -300,6 +377,12 @@ sequenceDiagram
     C-->>U: 201 订单创建成功
 ```
 
+## 4. 需求实现对照
+
+| 函数 | 实现需求 |
+|---|---|
+{trace_rows}
+
 ```json
 {json.dumps(meta, ensure_ascii=False)}
 ```
@@ -308,6 +391,10 @@ sequenceDiagram
 
     # ---- 阶段5：测试用例 ----
     if role == "testcase":
+        frs = _fr_ids(prompt)
+        p0 = _p0_ids(prompt)
+        # 先铺 P0，再铺其余需求，保证 mock 产物一定通过追溯校验
+        pool = p0 + [f for f in frs if f not in p0]
         cases = [
             {"id": "TC-001", "module": "订单", "title": "正常下单成功", "type": "功能",
              "priority": "P0", "preconditions": "用户已登录；商品A库存≥1",
@@ -334,6 +421,12 @@ sequenceDiagram
              "steps": ["购买原价100元商品", "提交订单查看金额"],
              "expected": "订单实付金额为95元"},
         ]
+        for i, c in enumerate(cases):
+            c["fr_ids"] = [pool[i % len(pool)]] if pool else []
+        for j in range(len(cases), len(pool)):
+            tgt = cases[j % len(cases)]["fr_ids"]
+            if pool[j] not in tgt:
+                tgt.append(pool[j])
         return json.dumps({"testcases": cases}, ensure_ascii=False)
 
     return "OK"

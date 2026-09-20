@@ -6,6 +6,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
 import config
+from core import stream_bus
 from db.models import PipelineLog, Project, SessionLocal
 from pipeline.graph import build_graph
 
@@ -43,6 +44,9 @@ def _run_graph(project_id: int, invoke_input):
     """在后台线程执行 graph.invoke；结束后更新运行集合。
     注意：invoke 在到达 END 或遇到 interrupt（评审门）时都会返回，
     需用 get_state().next 区分二者。"""
+    # 本轮执行的实时事件通道：智能体输出的增量经此推给前端 SSE
+    stream_bus.open_channel(project_id)
+    reason = "stopped"
     try:
         with SqliteSaver.from_conn_string(str(config.CHECKPOINT_DB)) as cp:
             graph = build_graph(cp)
@@ -50,14 +54,19 @@ def _run_graph(project_id: int, invoke_input):
             snap = graph.get_state(_config(project_id))
         if snap.next:
             # 停在 interrupt 评审门：agent 节点已把状态置为 waiting_review
+            reason = "waiting_review"
             _log(project_id, "流水线暂停，等待人工评审")
         else:
+            reason = "completed"
             _set_status(project_id, "completed")
             _log(project_id, "全部阶段评审通过，流水线完成")
     except Exception as e:
+        reason = "failed"
         _log(project_id, f"流水线异常终止: {e}\n{traceback.format_exc()}", "ERROR")
         _set_status(project_id, "failed", str(e))
     finally:
+        # 关通道会先给订阅端发 run_end，再让 SSE 生成器正常收尾
+        stream_bus.close_channel(project_id, reason)
         with _lock:
             _running.discard(project_id)
 
