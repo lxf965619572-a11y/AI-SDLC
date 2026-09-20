@@ -20,6 +20,23 @@ APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
 APP_PORT = int(os.getenv("APP_PORT", "5100"))
 APP_DEBUG = os.getenv("APP_DEBUG", "1") == "1"
 
+
+def _asset_version() -> str:
+    """前端资源版本号：取 app.css / app.js 的最新修改时间。
+
+    Flask 对 static 默认发 12 小时缓存，改完前端不强制刷新就还是旧界面；
+    带上这个版本号，重启服务后浏览器自然拿新文件，第三方库仍走缓存。"""
+    newest = 0.0
+    for name in ("css/app.css", "js/app.js"):
+        try:
+            newest = max(newest, (BASE_DIR / "static" / name).stat().st_mtime)
+        except OSError:
+            pass
+    return str(int(newest))
+
+
+ASSET_VERSION = os.getenv("ASSET_VERSION", "") or _asset_version()
+
 # 解析阶段 LLM 抽取并发批次数（大文档可调高以提速）
 MAP_CONCURRENCY = int(os.getenv("MAP_CONCURRENCY", "8"))
 

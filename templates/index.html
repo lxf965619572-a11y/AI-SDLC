@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>多智能体软件开发流水线</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v={{ asset_v }}">
 <script src="{{ url_for('static', filename='libs/marked.min.js') }}"></script>
 <script src="{{ url_for('static', filename='libs/mermaid.min.js') }}"></script>
 </head>
@@ -115,6 +115,19 @@
           <button class="btn btn-primary" onclick="exportReport('xlsx')"
                   title="报告附表：结论 / 用例 / 覆盖率 / 静态违规 / 问题与偏差 / 证据清单">导出附表 Excel</button>
         </div>
+        <div class="export-row" id="bundleExportRow" style="display:none">
+          <span class="export-label">软件工程包</span>
+          <div class="bundle-col">
+            <div class="bundle-actions">
+              <button class="btn btn-primary" id="btnBundleExport" onclick="exportBundle('zip')"
+                      title="整包交付件：各阶段文档 + 源码基线 + 追溯件 + 每轮验证证据 + 包清单（逐文件 sha256）">导出工程包 ZIP</button>
+              <button class="btn btn-outline" id="btnBundleDir" onclick="exportBundle('dir')"
+                      title="只在服务器 outputs 目录下生成整包目录并返回路径，便于本地直接打开检查">仅生成目录</button>
+            </div>
+            <div class="bundle-state" id="bundleState"></div>
+            <div class="bundle-warns" id="bundleWarns" style="display:none"></div>
+          </div>
+        </div>
       </div>
 
       <!-- 需求追溯矩阵：素材 → 需求 → 概设 → 详设 → 用例 -->
@@ -211,6 +224,6 @@
   </div>
 </div>
 
-<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+<script src="{{ url_for('static', filename='js/app.js') }}?v={{ asset_v }}"></script>
 </body>
 </html>

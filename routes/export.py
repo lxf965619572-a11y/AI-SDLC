@@ -1,16 +1,19 @@
-"""导出 API：测试用例（Excel / XMind）+ 各阶段文档（Word / Markdown）+ 需求追溯矩阵。"""
+"""导出 API：测试用例（Excel / XMind）+ 各阶段文档（Word / Markdown）+ 需求追溯矩阵
++ 软件工程包（文档 / 源码基线 / 追溯件 / 验证证据 一整包）。"""
 import re
 
 from flask import Blueprint, jsonify, request, send_file
 
 import config
 from db.models import Project, SessionLocal, StageArtifact
+from exporters.bundle_exporter import BundleError
 from exporters.excel_exporter import export_excel
 from exporters.xmind_exporter import export_xmind
 from exporters.docx_exporter import export_docx
 from exporters.trace_exporter import export_trace_excel
 from exporters.report_exporter import export_report_docx, export_report_excel
 from pipeline.nodes import STAGE_TITLES
+from services import bundle_service
 from services.report_service import build_report_data
 from services.trace_service import build_project_matrix
 
@@ -148,5 +151,47 @@ def export_report(pid: int):
         path = export_report_excel(data, str(out_dir / fname))
     else:
         fname = f"{name}_软件测评报告.docx"
-        path = export_report_docx(data, str(out_dir / fname))
+    path = export_report_docx(data, str(out_dir / fname))
     return send_file(path, as_attachment=True, download_name=fname)
+
+
+@bp.get("/projects/<int:pid>/export/bundle")
+def export_bundle(pid: int):
+    """导出软件工程包。
+
+    format=zip   下载整包（默认）
+    format=dir   只在服务器 OUTPUT_DIR 下生成目录，返回路径与核对结论（便于本地打开）
+    format=plan  不落盘，只返回装配计划摘要：前端在导出前就能报出基线版本与告警
+
+    包内源码基线取「最后一次验证执行真正跑过的那一版」，并与该轮证据的输入指纹
+    逐字节核对；对不上不拦导出，但会在包清单里显式标红——交付件宁可难看，不可含糊。"""
+    fmt = request.args.get("format", "zip").lower()
+    if fmt not in ("zip", "dir", "plan"):
+        return jsonify({"error": "format 参数必须为 zip、dir 或 plan"}), 400
+
+    with SessionLocal() as session:
+        p = session.get(Project, pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        name = _safe_name(p.name)
+
+    try:
+        if fmt == "plan":
+            return jsonify(bundle_service.plan_summary(pid))
+        res = bundle_service.build_bundle(pid, want_zip=(fmt == "zip"))
+    except BundleError as e:
+        return jsonify({"error": str(e)}), 404
+    except OSError as e:
+        return jsonify({"error": f"工程包生成失败：{e}"}), 500
+
+    if fmt == "dir":
+        return jsonify({"dir": res["dir"], "name": res["name"],
+                        "file_count": res["file_count"],
+                        "files": [f["path"] for f in res["files"]],
+                        "aligned": res["aligned"], "mismatched": res["mismatched"],
+                        "warnings": res["warnings"],
+                        "baseline": {k: res["baseline"].get(k) for k in
+                                     ("tag", "code_version", "test_version",
+                                      "exec_version", "exec_ok", "reason")}})
+    return send_file(res["zip"], as_attachment=True,
+                     download_name=f"{name}_软件工程包.zip")

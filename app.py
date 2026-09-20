@@ -43,7 +43,7 @@ app.register_blueprint(chat_routes.bp)
 
 @app.get("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", asset_v=config.ASSET_VERSION)
 
 
 def restore_waiting_states():

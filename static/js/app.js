@@ -681,9 +681,92 @@ function renderExport(st) {
   /* 测评报告要有判据才导出：静态检查或验证执行至少产出过一份，
    * 否则导出的是一份通篇「未产出」的空报告，那比不导出更容易误导评审。 */
   const hasReport = !!(a["report"] || a["exec"] || a["static"]);
+  /* 工程包以源码基线为本体：没有代码产物就装配不出包，按钮不出现。 */
+  const hasBundle = !!a["code"];
   document.getElementById("caseExportRow").style.display = hasCase ? "flex" : "none";
   document.getElementById("reportExportRow").style.display = hasReport ? "flex" : "none";
-  card.style.display = (hasCase || hasReport) ? "block" : "none";
+  document.getElementById("bundleExportRow").style.display = hasBundle ? "flex" : "none";
+  card.style.display = (hasCase || hasReport || hasBundle) ? "block" : "none";
+  if (hasBundle) refreshBundlePlan(bundleKeyOf(a));
+  else { bundlePlanKey = ""; bundlePlan = null; }
+}
+
+/* ---------- 软件工程包 ----------
+ * 出包前先把装配计划摘要拉回来摆在按钮旁边：基线是哪一版、与执行证据对不对得上、
+ * 有哪些告警。交付件的诚实性必须在下手之前可见，而不是解压之后才发现。
+ * 计划按「相关产物版本号」做键缓存，轮询期间不重复请求。 */
+let bundlePlan = null;
+let bundlePlanKey = "";
+
+function bundleKeyOf(a) {
+  const v = s => (a[s] ? a[s].version : 0);
+  return [currentProjectId, v("code"), v("test_impl"), v("exec"),
+          v("static"), v("report")].join(":");
+}
+
+async function refreshBundlePlan(key) {
+  if (key === bundlePlanKey) return;
+  bundlePlanKey = key;
+  const pid = currentProjectId;
+  const el = document.getElementById("bundleState");
+  const box = document.getElementById("bundleWarns");
+  el.className = "bundle-state";
+  el.textContent = "正在核对源码基线与验证证据…";
+  box.style.display = "none";
+  try {
+    const plan = await api(`/api/projects/${pid}/export/bundle?format=plan`);
+    if (pid !== currentProjectId || key !== bundlePlanKey) return;   // 已切项目/已有新计划
+    bundlePlan = plan;
+    paintBundlePlan(plan);
+  } catch (e) {
+    if (pid !== currentProjectId) return;
+    bundlePlanKey = "";                 // 失败不缓存，下次轮询再试
+    bundlePlan = null;
+    el.className = "bundle-state bundle-warn";
+    el.textContent = "工程包装配计划读取失败：" + e.message;
+  }
+}
+
+function paintBundlePlan(p) {
+  const el = document.getElementById("bundleState");
+  const box = document.getElementById("bundleWarns");
+  const b = p.baseline || {};
+  const exec = b.exec_version
+    ? `exec v${b.exec_version} ${b.exec_ok ? "通过" : "未通过"}`
+    : "未做验证执行";
+  const align = p.aligned === true ? "与执行证据逐字节一致"
+    : (p.aligned === false ? "与执行证据不一致" : "无执行证据可核对");
+  const runs = p.evidence_runs || [];
+  el.textContent = [
+    `基线 代码 v${b.code_version || "-"} + 测试实现 v${b.test_version || "-"}`,
+    `${exec}（标签 ${b.tag || "-"}）`,
+    align,
+    `文档 ${p.doc_count} 份`,
+    `源码 ${p.source_files} 个`,
+    `证据 ${runs.length} 轮`,
+    (p.missing_stages || []).length ? `未产出 ${p.missing_stages.length} 项` : "",
+  ].filter(Boolean).join(" · ");
+  el.className = "bundle-state " +
+    (p.aligned === false ? "bundle-warn" : (p.warnings || []).length ? "bundle-warn" : "bundle-ok");
+  el.title = "基线来源：" + (b.reason || "-");
+
+  const warns = p.warnings || [];
+  box.innerHTML = "";
+  if (!warns.length) { box.style.display = "none"; return; }
+  box.style.display = "flex";
+  warns.slice(0, 3).forEach(w => {
+    const line = document.createElement("div");
+    line.className = "bundle-warn-line" + (p.aligned === false ? " bad" : "");
+    line.textContent = "⚠ " + w;
+    line.title = w;
+    box.appendChild(line);
+  });
+  if (warns.length > 3) {
+    const more = document.createElement("div");
+    more.className = "bundle-more";
+    more.textContent = `另有 ${warns.length - 3} 条告警，详见包内 00_包清单/包清单.md`;
+    box.appendChild(more);
+  }
 }
 
 /* ---------- 产物渲染 ---------- */
@@ -1446,6 +1529,48 @@ function exportCases(fmt) {
 
 function exportReport(fmt) {
   window.open(`/api/projects/${currentProjectId}/export/report?format=${fmt}`, "_blank");
+}
+
+/* 工程包导出。zip 走 fetch 而不是 window.open：装配失败时后端返回的是 JSON 错误，
+ * 新开标签页只会甩给用户一屏 JSON，这里能把它变成一句人话，也能给出装配中的按钮态。 */
+async function exportBundle(fmt) {
+  const pid = currentProjectId;
+  if (!pid) { toast("请先选择项目", true); return; }
+  const btn = document.getElementById(fmt === "dir" ? "btnBundleDir" : "btnBundleExport");
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = fmt === "dir" ? "生成中…" : "装配中…";
+  try {
+    if (fmt === "dir") {
+      const r = await api(`/api/projects/${pid}/export/bundle?format=dir`);
+      toast(`工程包已生成：${r.dir}（${r.file_count} 个文件）`);
+    } else {
+      const resp = await fetch(`/api/projects/${pid}/export/bundle?format=zip`);
+      if (!resp.ok) {
+        let msg = `HTTP ${resp.status}`;
+        try { msg = (await resp.json()).error || msg; } catch (e) { /* 非 JSON 响应 */ }
+        throw new Error(msg);
+      }
+      const blob = await resp.blob();
+      const name = `${(bundlePlan && bundlePlan.bundle_name) || "软件工程包"}.zip`;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      toast(`工程包已下载：${name}`);
+    }
+    bundlePlanKey = "";        // 出包会重写目录与哈希，回来重新核对一次
+  } catch (e) {
+    toast("工程包导出失败：" + e.message, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+  refreshDetail();
 }
 
 /* ---------- 新建项目 ---------- */
