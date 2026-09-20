@@ -50,10 +50,24 @@ GATE_NEXT = {
     "test_impl": "exec_node",
 }
 
-# 人工在这几个阶段做出裁决，等于重新给一次基线：自动修复轮数清零。
-# 否则一次人工驳回就会吃掉 MAX_FIX_ROUNDS 的额度，工具判据反而失效——
-# 超限后每轮重生都会立刻再判超限，人工再也拿不到一次完整的自动整改。
+# 人工裁决与自动修复额度的关系。额度清零 = 重新给一轮完整的自动整改机会：
+#   工具裁决门（static/exec）：人工在这里对工具结论本身表态（偏差单放行、问题报告单
+#     受理或驳回），通过与驳回都算重新给基线；
+#   文档评审门（code/test_impl）：只有驳回算人工介入。通过是放行自动闭环的下一轮，
+#     额度必须接着累计——自动整改每轮都要再过一次代码评审门，门一通过就把计数清零的
+#     话，MAX_FIX_ROUNDS 永远触发不了，超限的问题报告单与人工裁决入口形同虚设，
+#     失败可以靠着「重生→过门→再失败」无限循环下去。
+TOOL_GATE_STAGES = ("static", "exec")
 RESET_FIX_ROUNDS = ("code", "test_impl", "static", "exec")
+
+
+def gate_fix_rounds(stage: str, approved: bool) -> dict | None:
+    """评审门对自动修复额度的处置：None 表示不动，字典表示清零（规则见常量注释）。"""
+    if stage not in RESET_FIX_ROUNDS:
+        return None
+    if approved and stage not in TOOL_GATE_STAGES:
+        return None
+    return {"static": 0, "exec": 0}
 
 
 def log(session, project_id: int, message: str, stage: str | None = None,
@@ -370,9 +384,9 @@ def make_gate(stage: str):
             if approved:
                 _set_status(session, project_id, "running", stage)
         update = {"retry_comments": comments if not approved else None}
-        if stage in RESET_FIX_ROUNDS:
-            # 人工裁决即重新给满自动修复额度（通过与驳回都要，见常量注释）
-            update["fix_rounds"] = {"static": 0, "exec": 0}
+        reset = gate_fix_rounds(stage, approved)
+        if reset is not None:
+            update["fix_rounds"] = reset
         return update
 
     return gate_node
