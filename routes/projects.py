@@ -54,6 +54,28 @@ def create_project():
         return jsonify({"id": p.id, "name": p.name, "status": p.status})
 
 
+@bp.delete("/projects/<int:pid>")
+def delete_project(pid: int):
+    """删除项目及它的全部数据：上传文档、各阶段产物、评审记录、日志，
+    以及服务器磁盘上的导出件与验证证据。不可恢复。
+
+    运行中禁止删除（先取消流水线并等它停下来）。验证机上的工作区不动——
+    删除必须在验证机不可达时也能成功，远端位置在响应里给出，由人自己决定清不清。"""
+    with SessionLocal() as session:
+        p = session.get(Project, pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        if p.status in ("running", "parsing"):
+            return jsonify({"error": "流水线运行中，请先取消并等它停下来再删除"}), 409
+    try:
+        removed = pipeline_service.delete_project(pid)
+    except LookupError:
+        return jsonify({"error": "项目不存在"}), 404
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 409
+    return jsonify({"ok": True, "removed": removed})
+
+
 @bp.post("/projects/<int:pid>/upload")
 def upload(pid: int):
     if "file" not in request.files:
@@ -99,9 +121,13 @@ def delete_document(pid: int, doc_id: int):
             return jsonify({"error": "文档不存在"}), 404
         from db.models import Chunk
         session.query(Chunk).filter_by(document_id=doc.id).delete()
+        stored = doc.stored_path
         session.delete(doc)
         session.commit()
-        return jsonify({"ok": True})
+    # 上传原件一并删掉：只删记录不删文件的话，data/uploads 会一直长
+    from services import storage
+    storage.remove_upload(stored)
+    return jsonify({"ok": True})
 
 
 @bp.post("/projects/<int:pid>/start")

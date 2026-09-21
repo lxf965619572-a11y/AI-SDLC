@@ -46,7 +46,7 @@ def export_testcases(pid: int):
         cases = art.meta_json["testcases"]
         name = _safe_name(p.name)
 
-    out_dir = config.OUTPUT_DIR / f"project_{pid}"
+    out_dir = config.project_outputs_dir(pid)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if fmt == "excel":
@@ -82,7 +82,7 @@ def export_stage_doc(pid: int, stage: str):
         title = art.title
         name = _safe_name(p.name)
 
-    out_dir = config.OUTPUT_DIR / f"project_{pid}"
+    out_dir = config.project_outputs_dir(pid)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if fmt == "md":
@@ -115,7 +115,7 @@ def export_traceability(pid: int):
     if not data.get("rows"):
         return jsonify({"error": "需求产物尚未生成，暂无可导出的追溯矩阵"}), 404
 
-    out_dir = config.OUTPUT_DIR / f"project_{pid}"
+    out_dir = config.project_outputs_dir(pid)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = export_trace_excel(data, str(out_dir / f"{name}_需求追溯矩阵.xlsx"),
                               project_name=proj_name)
@@ -144,7 +144,7 @@ def export_report(pid: int):
     if not arts.get("exec") and not arts.get("static"):
         return jsonify({"error": "测评报告尚未生成：需先完成静态检查或验证执行"}), 404
 
-    out_dir = config.OUTPUT_DIR / f"project_{pid}"
+    out_dir = config.project_outputs_dir(pid)
     out_dir.mkdir(parents=True, exist_ok=True)
     if fmt == "xlsx":
         fname = f"{name}_软件测评报告附表.xlsx"

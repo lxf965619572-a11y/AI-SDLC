@@ -59,7 +59,16 @@ body {
 }
 .project-item:hover { background: var(--primary-soft); }
 .project-item.active { background: var(--primary-soft); border-color: var(--primary); }
-.project-item .pi-name { font-weight: 600; margin-bottom: 4px; }
+.project-item .pi-top { display: flex; align-items: flex-start; gap: 6px; }
+.project-item .pi-name { font-weight: 600; margin-bottom: 4px; flex: 1; min-width: 0; }
+.pi-del {
+  flex: 0 0 auto; border: none; background: transparent; cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 2px 4px; border-radius: 6px;
+  color: var(--text-sub); opacity: 0;      /* 平时藏起来：一列项目全挂垃圾桶太吵 */
+}
+.project-item:hover .pi-del, .pi-del:focus-visible { opacity: .7; }
+.pi-del:hover { opacity: 1; background: #fef2f2; color: var(--danger); }
+.pi-del:disabled { opacity: 0; cursor: not-allowed; }   /* 运行中不可删，见 title 提示 */
 .project-item .pi-meta { font-size: 12px; color: var(--text-sub); display: flex; gap: 8px; align-items: center; }
 
 /* ---- 主区域 ---- */

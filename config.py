@@ -143,3 +143,17 @@ def llm_cache_flavor(role: str = "extraction") -> str:
     if llm_mock_enabled():
         return "mock"
     return get_llm_config(role).get("model") or "default"
+
+
+# ---------------- 项目产物在磁盘上的位置 ----------------
+# 导出、装配工程包、归档证据、删除项目都按这两个函数取路径。
+# 命名规则只此一处：各处自己拼 f"project_{pid}" 的话，改了导出路径就会漏删，
+# data/ 下留下一堆没有任何记录指向的孤儿目录。
+def project_outputs_dir(project_id: int) -> Path:
+    """导出件目录：各阶段 docx / 追溯与测评 xlsx / XMind / 软件工程包。"""
+    return Path(OUTPUT_DIR) / f"project_{project_id}"
+
+
+def project_evidence_dir(project_id: int) -> Path:
+    """验证证据目录：每一轮执行的原始日志与解析结果（下面再按 v<版本> 分轮）。"""
+    return Path(VERIFY_EVIDENCE_DIR) / f"p{project_id}"

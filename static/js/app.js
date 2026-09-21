@@ -428,15 +428,59 @@ async function loadProjects() {
   projects.forEach(p => {
     const div = document.createElement("div");
     div.className = "project-item" + (p.id === currentProjectId ? " active" : "");
-    div.innerHTML = `<div class="pi-name">${escapeHtml(p.name)}</div>
+    const busy = p.status === "running" || p.status === "parsing";
+    div.innerHTML = `<div class="pi-top">
+        <div class="pi-name">${escapeHtml(p.name)}</div>
+        <button class="pi-del" aria-label="删除项目 ${escapeHtml(p.name)}"
+          title="${busy ? "流水线运行中，取消并停止后才能删除" : "删除项目"}"${
+          busy ? " disabled" : ""}>🗑</button>
+      </div>
       <div class="pi-meta">
         <span class="status-pill st-${p.status}" style="padding:1px 8px;font-size:11px">${STATUS_TEXT[p.status] || p.status}</span>
         <span>${p.created_at}</span>
       </div>`;
     div.onclick = () => selectProject(p.id);
+    // 整行是可点的（切换项目），删除按钮必须拦掉冒泡，否则删完还顺带切一次项目
+    div.querySelector(".pi-del").onclick = e => {
+      e.stopPropagation();
+      deleteProject(p.id, p.name);
+    };
     list.appendChild(div);
   });
   return projects;
+}
+
+/* 删除项目：库内记录、检查点、磁盘上的导出件与验证证据一并清掉，不可恢复。
+ * 删的正是当前项目时，还要把详情区、轮询与 SSE 一起收干净再回空状态，
+ * 否则界面上会留着一个已经不存在的项目。 */
+async function deleteProject(pid, name) {
+  if (!confirm(`删除项目「${name}」？\n\n上传文档、各阶段产物、评审记录、导出件与验证证据会一并删除，且不可恢复。`)) return;
+  let res;
+  try {
+    res = await api(`/api/projects/${pid}`, { method: "DELETE" });
+  } catch (e) {
+    toast("删除失败：" + e.message, true);
+    loadProjects().catch(() => {});   // 可能刚被启动：刷新徽标与按钮禁用态
+    return;
+  }
+  const r = (res && res.removed) || {};
+  toast(`项目「${name}」已删除（产物 ${r.artifacts || 0} 份 / 文档 ${r.documents || 0} 份）`);
+  delete lastStatusByProject[pid];
+  if (currentProjectId !== pid) { await loadProjects(); return; }
+
+  currentProjectId = null;
+  renderToken++;               // 作废该项目所有在途回包
+  closeLiveStream();
+  endLiveStage();
+  releasePin();
+  stopPolling();
+  currentArtifactStage = null;
+  resetDetailUI();
+  const ctx = document.getElementById("chatCtx");
+  if (ctx) ctx.textContent = "未选择项目";
+  document.getElementById("detail").style.display = "none";
+  document.getElementById("emptyState").style.display = "block";
+  await loadProjects();
 }
 
 function selectProject(pid) {

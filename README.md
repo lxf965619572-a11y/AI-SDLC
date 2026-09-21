@@ -299,6 +299,7 @@ tests/              零依赖测试脚本（run_all.py 一键全跑）
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | /api/projects | 新建项目 |
+| DELETE | /api/projects/&lt;id&gt; | 删除项目（含上传文档、各阶段产物、评审记录、日志、导出件与验证证据；运行中返回 409） |
 | POST | /api/projects/&lt;id&gt;/upload | 上传需求文档 |
 | POST | /api/projects/&lt;id&gt;/start | 启动流水线 |
 | GET | /api/projects/&lt;id&gt;/status | 轮询状态 |

@@ -59,7 +59,7 @@ def archive_evidence(outcome: dict, project_id: int, version, stage: str = "exec
     争议往往落在「到底是哪个目标上挂的」，那时要能单独拿出那个目标的原始输出。"""
     import config
 
-    base = Path(config.VERIFY_EVIDENCE_DIR) / f"p{project_id}" / f"v{version}"
+    base = config.project_evidence_dir(project_id) / f"v{version}"
     base.mkdir(parents=True, exist_ok=True)
     path = base / f"{stage}.log"
     try:

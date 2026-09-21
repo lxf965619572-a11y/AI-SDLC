@@ -97,7 +97,7 @@ def build_bundle(pid: int, out_root=None, want_zip: bool = True) -> dict:
     if matrix is None:
         plan["warnings"].append("需求追溯矩阵未产出（缺需求产物），包内 03_追溯 不含矩阵")
 
-    root = Path(out_root) if out_root else (Path(config.OUTPUT_DIR) / f"project_{pid}")
+    root = Path(out_root) if out_root else config.project_outputs_dir(pid)
     res = write_bundle(plan, root, matrix=matrix)
     res["matrix_included"] = bool(matrix)
     if want_zip:

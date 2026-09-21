@@ -237,3 +237,66 @@ def reset_project(project_id: int):
             proj.error = None
         session.commit()
     _log(project_id, "项目已重置，可重新启动流水线")
+
+
+def delete_project(project_id: int) -> dict:
+    """彻底删除项目：库内记录 + LangGraph 检查点 + 磁盘产物（上传件、导出件、验证证据）。
+
+    与 reset_project 的区别：reset 保留项目与已上传文档、只清进度；delete 连项目
+    本身一起抹掉，侧栏不再出现，且不可恢复。
+
+    顺序是「先库后盘」：库里删干净了再删文件，反过来的话一旦删库失败就会留下
+    一个「记录还在、产物没了」的半截项目。文件删失败不影响删除成功——那些目录
+    已经没有任何记录指向它们，最坏结果只是占点磁盘，会在返回值里如实报出来。
+
+    运行中禁止删除：后台线程还在写库写文件，边删边写必然留下脏数据。
+    """
+    from core import cancel as cancel_mod
+    from db.models import Chunk, Document, Review, StageArtifact
+    from services import storage
+
+    with _lock:
+        if project_id in _running:
+            raise RuntimeError("流水线正在运行中，无法删除；请先取消并等它停下来")
+
+    with SessionLocal() as session:
+        proj = session.get(Project, project_id)
+        if proj is None:
+            raise LookupError("项目不存在")
+        if proj.status in ("running", "parsing"):
+            raise RuntimeError("流水线运行中，无法删除；请先取消并等它停下来")
+        name = proj.name
+        docs = session.query(Document).filter_by(project_id=project_id).all()
+        uploads = [d.stored_path for d in docs if d.stored_path]
+        counts = {
+            "documents": len(docs),
+            "artifacts": session.query(StageArtifact)
+            .filter_by(project_id=project_id).count(),
+        }
+        doc_ids = [d.id for d in docs]
+        if doc_ids:
+            session.query(Chunk).filter(Chunk.document_id.in_(doc_ids)).delete(
+                synchronize_session=False)
+        session.query(Review).filter_by(project_id=project_id).delete(
+            synchronize_session=False)
+        session.query(StageArtifact).filter_by(project_id=project_id).delete(
+            synchronize_session=False)
+        session.query(PipelineLog).filter_by(project_id=project_id).delete(
+            synchronize_session=False)
+        session.query(Document).filter_by(project_id=project_id).delete(
+            synchronize_session=False)
+        session.delete(proj)
+        session.commit()
+
+    # 库外状态：检查点（否则同名 thread_id 复用会让新项目继承旧图状态）、
+    # 取消标志、SSE 通道（不关会一直挂在注册表里）。
+    _clear_checkpoints(project_id)
+    cancel_mod.clear(project_id)
+    stream_bus.close_channel(project_id, "deleted")
+
+    removed_uploads = sum(1 for p in uploads if storage.remove_upload(p))
+    dirs = storage.remove_project_dirs(project_id)
+    return {"id": project_id, "name": name, **counts,
+            "uploads_removed": removed_uploads, "uploads_total": len(uploads),
+            "outputs_removed": dirs["outputs"], "evidence_removed": dirs["evidence"],
+            "remote_workdir": storage.remote_workdir_hint(project_id)}
