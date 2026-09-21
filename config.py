@@ -57,6 +57,17 @@ VERIFY_TIMEOUT = int(os.getenv("VERIFY_TIMEOUT", "300"))
 # =1 时忽略 VERIFY_HOST，改用本机工具链（Linux/macOS 开发机自测用）
 VERIFY_LOCAL = os.getenv("VERIFY_LOCAL", "0") == "1"
 
+# ===== 目标机矩阵（多指令集 / 字长 / 字节序）=====
+# 宿主机跑绿只证明「在这台机器的 gcc 与 ABI 下行为正确」。星载软件的真实风险恰恰
+# 落在宿主机测不出来的地方：long 是 4 还是 8 字节、大端还是小端、32 位截断、
+# 结构体对齐。所以同一份源码要在多个目标架构上分别交叉编译 + qemu 执行 + 采覆盖率。
+# 逗号分隔的目标 id，可选值见 verification/targets.py 的 TARGETS
+# （host / arm32 / arm64 / ppc32）。默认只在验证机本机跑，证据布局与耗时不变。
+#   VERIFY_TARGETS=host,arm32,ppc32
+# 验证机一次性装交叉工具链：scripts/setup_verify_targets.sh（幂等，可重复执行）。
+# 配了交叉目标而验证机没装工具链时，该目标记「未验证」并整轮转人工，绝不静默放行。
+VERIFY_TARGETS = os.getenv("VERIFY_TARGETS", "").strip() or "host"
+
 # ===== 验证判据 =====
 # 分支覆盖率门限：低于该值的行在追溯矩阵里标红。0 表示不判覆盖率。
 COVERAGE_BRANCH_MIN = float(os.getenv("COVERAGE_BRANCH_MIN", "80"))
@@ -81,6 +92,16 @@ def verify_key_path() -> str:
 def verify_configured() -> bool:
     """是否配置了远端验证机。未配置时流水线退化为「只静态检查、不实际执行」。"""
     return bool(VERIFY_LOCAL or VERIFY_HOST)
+
+
+def verify_target_ids() -> list:
+    """解析 VERIFY_TARGETS → 目标 id 列表（顺序即执行顺序）。
+
+    写错就抛 TargetError，不静默降级成只测宿主机：那样报告上仍写着
+    「已在 N 个目标上验证」，而实际证据只有一个目标。"""
+    from verification import targets as tgt_tab
+
+    return tgt_tab.ids(VERIFY_TARGETS)
 
 
 def _role_env(role: str) -> dict:

@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from core import trace
+from verification import targets as tgt_tab
+from verification import parsers as v_parsers
 
 TITLE = "软件测评报告"
 STANDARD = "GJB 438B《军用软件开发文档通用要求》"
@@ -33,6 +35,17 @@ VERDICT_LABELS = {"ok": "通过", "fail": "不通过", "skipped": "未执行"}
 
 def _pct(value) -> str:
     return "-" if value is None else f"{float(value):.2f}%"
+
+
+def _per_target_cases(per_target: dict) -> str:
+    """一条用例的逐目标结论压成一格：只点名有问题的目标，全过就写「全部通过」。
+
+    多目标时最要看的正是「哪个架构上挂的」，所以格子里先给落点，不复述通过项。"""
+    if not per_target:
+        return "-"
+    bad = [f"{tid} {v_parsers.STATUS_TEXT.get(s, s)}"
+           for tid, s in per_target.items() if s != v_parsers.ST_PASS]
+    return "、".join(bad) if bad else f"{len(per_target)} 个目标全部通过"
 
 
 def _meta(arts: dict, stage: str) -> dict:
@@ -89,7 +102,56 @@ def _environment(exec_m: dict) -> dict:
             "workdir": exec_m.get("workdir") or "-",
             "duration_s": exec_m.get("duration_s"),
             "commands": exec_m.get("commands") or [],
+            "targets": exec_m.get("targets") or [],
+            "target_env": env.get("target_env") or {},
+            "target_probe": env.get("target_probe") or exec_m.get("target_probe") or {},
             "raw": env}
+
+
+def _targets_section(exec_m: dict) -> dict:
+    """目标机矩阵：同一份源码在哪些架构上分别编译执行过、各自结论如何。
+
+    只有真的跑了多个目标才给矩阵（multi=True）：单目标产物画一张「只有一个目标」
+    的表，会让审阅的人误以为做过跨架构验证。
+
+    字长、字节序、编译器、为何要测这个目标，一律从 verification.targets 的目标表
+    补齐，而不是只读产物里存的快照——入库时这些字段会被精简，而判据表是唯一来源。"""
+    per_target = exec_m.get("target_results") or {}
+    tenv_all = (exec_m.get("env") or {}).get("target_env") or {}
+    rows = []
+    for tid, t in per_target.items():
+        t = t or {}
+        facts = {**(tgt_tab.by_id(tid).facts() if tgt_tab.by_id(tid) else {}),
+                 **(t.get("facts") or {})}
+        v = t.get("verdict") or {}
+        tests = t.get("tests") or {}
+        cov = (t.get("coverage") or {}).get("totals") or {}
+        tenv = tenv_all.get(tid) or {}
+        rows.append({
+            "id": tid, "label": facts.get("label") or tid,
+            "bits": facts.get("bits"),
+            "endian": "大端" if facts.get("endian") == "big" else "小端",
+            "cc": facts.get("cc") or "-", "gcov": facts.get("gcov") or "-",
+            "qemu": facts.get("qemu") or "",
+            "run": f"qemu（{facts['qemu']}）" if facts.get("qemu") else "本机直接执行",
+            "cflags": facts.get("extra_cflags") or "-",
+            "ran": bool(t.get("ran")), "ok": bool(t.get("ok")),
+            "build": v.get("build"), "tests": v.get("tests"),
+            "coverage": v.get("coverage"),
+            "build_text": VERDICT_LABELS.get(v.get("build"), "-"),
+            "tests_text": VERDICT_LABELS.get(v.get("tests"), "-"),
+            "coverage_text": VERDICT_LABELS.get(v.get("coverage"), "-"),
+            "passed": tests.get("passed"), "failed": tests.get("failed"),
+            "missing": tests.get("missing"),
+            "line_pct": cov.get("line_pct"), "branch_pct": cov.get("branch_pct"),
+            "gcc": tenv.get("gcc") or "-", "gcov_version": tenv.get("gcov") or "-",
+            "reason": t.get("reason") or t.get("error") or "",
+            "why": (tgt_tab.by_id(tid).why if tgt_tab.by_id(tid) else "") or t.get("why") or "",
+        })
+    return {"multi": len(rows) > 1, "rows": rows,
+            "ids": exec_m.get("targets") or [r["id"] for r in rows],
+            "probe": (exec_m.get("env") or {}).get("target_probe")
+                     or exec_m.get("target_probe") or {}}
 
 
 def _tests_section(exec_m: dict) -> dict:
@@ -114,6 +176,10 @@ def _coverage_section(exec_m: dict) -> dict:
             "untested_functions": c.get("untested_functions") or [],
             "thresholds": c.get("thresholds") or exec_m.get("thresholds") or {},
             "ok": bool(c.get("ok")),
+            # 多目标合并时逐目标的总体覆盖率：总体数字取的是各目标最差值，
+            # 审阅时要能看出是哪个目标把数字拉下来的。
+            "per_target": c.get("per_target") or {},
+            "merged_targets": c.get("merged_targets") or [],
             "verdict": (exec_m.get("verdict") or {}).get("coverage")}
 
 
@@ -253,6 +319,7 @@ def assemble_report(arts: dict, project_name: str = "", versions: dict | None = 
         "tests": _tests_section(exec_m),
         "coverage": _coverage_section(exec_m),
         "static": _static_section(static_m),
+        "targets": _targets_section(exec_m),
         "trace": _trace_summary(arts, coverage_min),
         "problems": _problems(history, arts),
         "deviations": _deviations(arts, static_m),
@@ -316,16 +383,40 @@ def report_markdown(data: dict) -> str:
         ["CPU 核数", env.get("cores")], ["传输方式", env.get("transport")],
         ["远端工作区", env.get("workdir")],
         ["本轮耗时(s)", env.get("duration_s")]])
-    L += ["", "### 3.2 测评方法", "",
-          "1. 静态检查：按受限子集规则表（与代码生成提示词同源）逐条判定，"
-          "并核对详细设计函数是否全部落地；",
-          "2. 可执行测试：在验证机上以 `gcc -std=c99 -Wall -Wextra` 编译并链接测试程序，"
-          "运行后按 `TC-xxx PASS/FAIL` 逐条判定；",
-          "3. 覆盖率：以 `-fprofile-arcs -ftest-coverage` 插桩，"
-          "解析 `gcov -b -c` 输出得到函数级行/分支覆盖；",
-          f"4. 判据门限：分支覆盖 ≥ {_pct(th.get('branch_min'))}，"
-          f"行覆盖 ≥ {_pct(th.get('line_min'))}，圈复杂度 ≤ "
-          f"{(st.get('thresholds') or {}).get('complexity_max', '-')}。", ""]
+    tg = data.get("targets") or {}
+    trows = tg.get("rows") or []
+    if tg.get("multi"):
+        L += ["", "#### 3.1.1 目标机矩阵", "",
+              "> 同一份源码在下列每个目标机上分别交叉编译并执行，汇总结论取各目标"
+              "**最差值**：任一目标不通过即整体不通过。工具链缺失的目标记为「未执行」，"
+              "整轮转人工裁决，不会被静默放行。", ""]
+        L += _table(["目标", "字长/字节序", "编译器", "执行方式", "构建", "用例",
+                     "覆盖率", "行/分支覆盖", "说明"],
+                    [[f"{r['id']} · {r['label']}", f"{r['bits']} 位 / {r['endian']}",
+                      r["cc"], r["run"], r["build_text"], r["tests_text"],
+                      r["coverage_text"],
+                      f"{_pct(r['line_pct'])} / {_pct(r['branch_pct'])}",
+                      r["reason"] or ("通过" if r["ok"] else "未通过")] for r in trows])
+        whys = [f"> - **{r['id']}**：{r['why']}" for r in trows if r.get("why")]
+        if whys:
+            L += ["", "> 为什么要测这些目标："] + whys
+        L.append("")
+    method = [
+        "1. 静态检查：按受限子集规则表（与代码生成提示词同源）逐条判定，"
+        "并核对详细设计函数是否全部落地；",
+        "2. 可执行测试：在验证机上以 `gcc -std=c99 -Wall -Wextra` 编译并链接测试程序，"
+        "运行后按 `TC-xxx PASS/FAIL` 逐条判定；",
+        "3. 覆盖率：以 `-fprofile-arcs -ftest-coverage` 插桩，"
+        "解析 `gcov -b -c` 输出得到函数级行/分支覆盖；",
+        f"4. 判据门限：分支覆盖 ≥ {_pct(th.get('branch_min'))}，"
+        f"行覆盖 ≥ {_pct(th.get('line_min'))}，圈复杂度 ≤ "
+        f"{(st.get('thresholds') or {}).get('complexity_max', '-')}。"]
+    if tg.get("multi"):
+        method.append(
+            f"5. 多目标执行：第 2、3 步在 {len(trows)} 个目标机上各跑一遍"
+            "（交叉编译 + `qemu-<arch>-static` 执行 + 目标架构 gcov 采集），"
+            "逐目标结论见 3.1.1，汇总取最差值而非多数表决。")
+    L += ["", "### 3.2 测评方法", ""] + method + [""]
 
     L += ["## 4 测评结果", "", "### 4.1 构建", "",
           f"结论：**{VERDICT_LABELS.get((data.get('build') or {}).get('verdict'), '-')}**"
@@ -342,9 +433,15 @@ def report_markdown(data: dict) -> str:
           f"未执行 {tests.get('missing', 0)}（设计用例 {len(tests.get('expected') or [])} 条）",
           ""]
     if tests.get("results"):
-        L += _table(["用例编号", "结果", "说明"],
-                    [[r.get("id"), r.get("status_text") or r.get("status"),
-                      r.get("detail")] for r in tests["results"]])
+        if tg.get("multi"):
+            L += _table(["用例编号", "结果", "各目标机", "说明"],
+                        [[r.get("id"), r.get("status_text") or r.get("status"),
+                          _per_target_cases(r.get("per_target")), r.get("detail")]
+                         for r in tests["results"]])
+        else:
+            L += _table(["用例编号", "结果", "说明"],
+                        [[r.get("id"), r.get("status_text") or r.get("status"),
+                          r.get("detail")] for r in tests["results"]])
         L.append("")
     if tests.get("consistent") is False:
         L += ["> **警告**：测试桩自报的用例数与实际输出不一致，上表结论不可直接采信。", ""]
@@ -357,6 +454,15 @@ def report_markdown(data: dict) -> str:
           f"（{totals.get('lines_hit', '-')}/{totals.get('lines_total', '-')}）　"
           f"分支覆盖 {_pct(totals.get('branch_pct'))}"
           f"（{totals.get('branch_taken', '-')}/{totals.get('branch_total', '-')}）", ""]
+    pt_cov = cov.get("per_target") or {}
+    if tg.get("multi") and pt_cov:
+        L += ["> 逐目标总体覆盖率（上面的汇总数字取各目标最差值，不是各目标平均）：", ""]
+        L += _table(["目标", "行覆盖", "分支覆盖", "门限判定"],
+                    [[tid, _pct((pt_cov.get(tid) or {}).get("totals", {}).get("line_pct")),
+                      _pct((pt_cov.get(tid) or {}).get("totals", {}).get("branch_pct")),
+                      "达标" if (pt_cov.get(tid) or {}).get("ok") else "未达标"]
+                     for tid in (cov.get("merged_targets") or list(pt_cov))])
+        L.append("")
     fns = cov.get("functions") or []
     if fns:
         L += _table(["函数", "文件", "行覆盖", "分支覆盖", "分支数", "是否执行"],
@@ -492,6 +598,9 @@ def export_report_excel(data: dict, path: str) -> str:
     cov = data.get("coverage") or {}
     totals = cov.get("totals") or {}
     st = data.get("static") or {}
+    tg = data.get("targets") or {}
+    trows = tg.get("rows") or []
+    multi = bool(tg.get("multi"))
     sheet("测评结论", ["项", "值"], [24, 84], [
         ["项目", data.get("project_name")],
         ["编制依据", data.get("standard")],
@@ -503,15 +612,31 @@ def export_report_excel(data: dict, path: str) -> str:
                               for k, v in (data.get("versions") or {}).items() if v)],
         ["执行环境", env.get("uname")],
         ["编译器 / 覆盖率工具", f"{env.get('gcc')} / {env.get('gcov')}"],
+        ["目标机", (f"{len(trows)} 个：{'、'.join(r['id'] for r in trows)}"
+                  "（汇总取各目标最差值）") if multi else (env.get("uname") or "-")],
         ["用例", f"通过 {tests.get('passed', 0)} / 失败 {tests.get('failed', 0)}"
                f" / 未执行 {tests.get('missing', 0)}"],
         ["覆盖率", f"行 {_pct(totals.get('line_pct'))} · 分支 {_pct(totals.get('branch_pct'))}"],
         ["静态检查", f"必查项 {st.get('required', 0)} 条 · 建议项 {st.get('advisory', 0)} 条"],
     ], first=True)
 
-    sheet("用例结果", ["用例编号", "结果", "说明"], [14, 10, 80],
-          [[r.get("id"), r.get("status_text") or r.get("status"), r.get("detail")]
-           for r in tests.get("results") or []])
+    if multi:
+        sheet("目标机矩阵",
+              ["目标", "架构", "字长", "字节序", "编译器", "覆盖率工具", "执行方式",
+               "构建", "用例", "覆盖率", "行覆盖%", "分支覆盖%", "说明"],
+              [10, 26, 8, 8, 26, 26, 22, 8, 8, 8, 10, 10, 60],
+              [[r["id"], r["label"], r["bits"], r["endian"], r["cc"], r["gcov"],
+                r["run"], r["build_text"], r["tests_text"], r["coverage_text"],
+                r["line_pct"], r["branch_pct"],
+                r["reason"] or ("通过" if r["ok"] else "未通过")] for r in trows])
+        sheet("用例结果", ["用例编号", "结果", "各目标机", "说明"], [14, 10, 30, 70],
+              [[r.get("id"), r.get("status_text") or r.get("status"),
+                _per_target_cases(r.get("per_target")), r.get("detail")]
+               for r in tests.get("results") or []])
+    else:
+        sheet("用例结果", ["用例编号", "结果", "说明"], [14, 10, 80],
+              [[r.get("id"), r.get("status_text") or r.get("status"), r.get("detail")]
+               for r in tests.get("results") or []])
     sheet("覆盖率", ["函数", "文件", "行覆盖%", "分支覆盖%", "分支数", "是否执行"],
           [28, 20, 12, 12, 10, 10],
           [[f.get("name"), f.get("file"), f.get("lines_pct"),

@@ -9,11 +9,21 @@ code→static→test_impl→exec→report 这条判据链——它不依赖模�
   2. 绿跑：comm 样例模块编译探针（code + 链接）→ 完整验证（构建/用例/覆盖率全绿）；
   3. 缺陷注入：把 CRC 初值改错 → 必须检出用例失败，且纯测试失败交归因（auto_decision=None）；
   4. 交付件：真实静态报告 + 真实执行结论 → 装配测评报告 → 导出 docx/xlsx 并确认可打开。
+  5. 多目标执行（`VERIFY_TARGETS` 配了 ≥2 个目标时）：同一份源码在每个目标机上
+     分别交叉编译 + qemu 执行 + 采覆盖率，逐目标指纹与证据各自落盘，报告出目标机矩阵；
+  6. 跨架构缺陷注入：写一处「隐含小端假设」的字节序代码 → 只在大端目标上暴露，
+     归因必须判成可移植性缺陷（责任在被测代码，不许改测试判据绕过）。
+
+第 2～4 步始终在验证机本机（host）跑，用来钉住单目标时代的证据布局一字不变；
+第 5～6 步才动多目标。只配了一个目标时这两步明确打印 SKIP，不算失败也不算通过。
 
 全部结论来自确定性工具输出。任一步不达标即退出码非 0，并打印失败明细。
 
-用法：`.venv\\Scripts\\python.exe scripts\\e2e_verify_vm.py`
+用法：`.venv\\Scripts\\python.exe scripts\\e2e_verify_vm.py [目标机列表]`
+      例：`.venv\\Scripts\\python.exe scripts\\e2e_verify_vm.py host,arm32,ppc32`
+      不给参数时取 .env 的 `VERIFY_TARGETS`。
 前置：先用 `scripts\\setup_verify_vm.ps1` 配好免密，.env 里 VERIFY_HOST/USER/KEY 就位。
+      多目标还需在验证机上装交叉工具链：`bash scripts/setup_verify_targets.sh`。
 """
 from __future__ import annotations
 
@@ -29,6 +39,7 @@ from exporters.report_exporter import (assemble_report, export_report_docx,
 from pipeline.nodes import _slim_exec, _slim_static
 from tests.fixtures import comm_sample as S
 from verification import executor
+from verification import targets as tgt_tab
 from verification.runner import runner_from_config
 
 # 用独立的项目号与工作区，绝不碰真实项目数据
@@ -36,6 +47,7 @@ PID = 9999
 OUT_DIR = config.VERIFY_EVIDENCE_DIR / "e2e"
 
 _FAILS: list[str] = []
+_SKIPS: list[str] = []
 
 
 def _check(cond: bool, label: str, detail: str = "") -> bool:
@@ -51,8 +63,13 @@ def _step(n: str, title: str) -> None:
     print("\n=== %s %s ===" % (n, title))
 
 
+def _skip(label: str, detail: str = "") -> None:
+    print("  [SKIP] " + label + (("  → " + detail) if detail else ""))
+    _SKIPS.append(label)
+
+
 def step_probe(r) -> bool:
-    _step("1/4", "探测验证机工具链")
+    _step("1/6", "探测验证机工具链")
     info = r.probe()
     _check(info.get("ok") is True, "工具链可用", info.get("error", ""))
     for k in ("uname", "cores", "gcc", "gcov", "make", "tar"):
@@ -62,7 +79,7 @@ def step_probe(r) -> bool:
 
 
 def step_green(r) -> dict | None:
-    _step("2/4", "绿跑：编译探针 + 完整验证（comm 样例模块）")
+    _step("2/6", "绿跑：编译探针 + 完整验证（comm 样例模块，验证机本机）")
     p1 = executor.compile_probe(r, PID, S.CODE_FILES, None, stage="code")
     _check(p1["ok"] and not p1.get("skipped"), "code 阶段编译探针通过",
            p1.get("reason", ""))
@@ -95,7 +112,7 @@ def step_green(r) -> dict | None:
 
 
 def step_defect(r) -> None:
-    _step("3/4", "缺陷注入：CRC 初值改错 → 必须检出并交归因")
+    _step("3/6", "缺陷注入：CRC 初值改错 → 必须检出并交归因")
     bad_c = S.COMM_C.replace("uint16_t crc = 0xFFFFu;", "uint16_t crc = 0x0000u;")
     if not _check(bad_c != S.COMM_C, "缺陷注入命中 CRC 初值"):
         return
@@ -118,7 +135,7 @@ def step_defect(r) -> None:
 
 
 def step_deliverables(r, green_out: dict | None) -> None:
-    _step("4/4", "交付件：真实静态报告 + 执行结论 → docx/xlsx")
+    _step("4/6", "交付件：真实静态报告 + 执行结论 → docx/xlsx")
     srep = c_static.check_files(S.CODE_FILES, {"complexity_max": config.COMPLEXITY_MAX},
                                 S.LLD_FUNCTIONS)
     _check(srep["ok"] and srep["required"] == 0, "静态检查零必查项违规",
@@ -127,31 +144,7 @@ def step_deliverables(r, green_out: dict | None) -> None:
     out = green_out or executor.run_verification(
         r, PID, "e2e-rpt", S.CODE_FILES, S.TEST_FILES, case_ids=S.CASE_IDS,
         branch_min=config.COVERAGE_BRANCH_MIN, line_min=config.COVERAGE_LINE_MIN)
-    arts = {
-        "requirement": {"markdown": "# 需求规格\nFR-001..FR-006", "meta": {},
-                        "version": 1, "status": "approved"},
-        "hld": {"markdown": "# 概要设计", "meta": {}, "version": 1, "status": "approved"},
-        "lld": {"markdown": "# 详细设计", "meta": {"functions": S.LLD_FUNCTIONS},
-                "version": 1, "status": "approved"},
-        "testcase": {"markdown": "# 测试用例设计",
-                     "meta": {"cases": [{"id": c, "fr_ids": ["FR-001"]} for c in S.CASE_IDS]},
-                     "version": 1, "status": "approved"},
-        "code": {"markdown": "# 代码实现",
-                 "meta": {"files": ["include/comm.h", "src/comm.c"]},
-                 "version": 1, "status": "approved"},
-        "test_impl": {"markdown": "# 测试实现",
-                      "meta": {"cases": [{"id": c, "fn": "comm_pack", "fr_ids": ["FR-001"]}
-                                         for c in S.CASE_IDS]},
-                      "version": 1, "status": "approved"},
-        "static": {"markdown": c_static.markdown_report(srep), "meta": _slim_static(srep),
-                   "version": 1, "status": "approved"},
-        "exec": {"markdown": executor.markdown_report(out), "meta": _slim_exec(out),
-                 "version": 1, "status": "approved"},
-    }
-    versions = {k: v["version"] for k, v in arts.items()}
-    data = assemble_report(arts, "通信协议样例模块（E2E 验收）", versions,
-                           history={"static": [arts["static"]], "exec": [arts["exec"]]},
-                           coverage_min=config.COVERAGE_BRANCH_MIN)
+    data = _assemble(out, "通信协议样例模块（E2E 验收）")
     _check((data.get("conclusion") or {}).get("pass") is True, "测评结论：通过")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -181,6 +174,173 @@ def step_deliverables(r, green_out: dict | None) -> None:
     print("        交付件目录：" + str(OUT_DIR))
 
 
+def _assemble(out: dict, name: str) -> dict:
+    """真实静态报告 + 真实执行结论 → 装配测评报告（与流水线 report 节点同一口径）。"""
+    srep = c_static.check_files(S.CODE_FILES, {"complexity_max": config.COMPLEXITY_MAX},
+                                S.LLD_FUNCTIONS)
+    arts = {
+        "requirement": {"markdown": "# 需求规格\nFR-001..FR-006", "meta": {},
+                        "version": 1, "status": "approved"},
+        "hld": {"markdown": "# 概要设计", "meta": {}, "version": 1, "status": "approved"},
+        "lld": {"markdown": "# 详细设计", "meta": {"functions": S.LLD_FUNCTIONS},
+                "version": 1, "status": "approved"},
+        "testcase": {"markdown": "# 测试用例设计",
+                     "meta": {"cases": [{"id": c, "fr_ids": ["FR-001"]} for c in S.CASE_IDS]},
+                     "version": 1, "status": "approved"},
+        "code": {"markdown": "# 代码实现",
+                 "meta": {"files": ["include/comm.h", "src/comm.c"]},
+                 "version": 1, "status": "approved"},
+        "test_impl": {"markdown": "# 测试实现",
+                      "meta": {"cases": [{"id": c, "fn": "comm_pack", "fr_ids": ["FR-001"]}
+                                         for c in S.CASE_IDS]},
+                      "version": 1, "status": "approved"},
+        "static": {"markdown": c_static.markdown_report(srep), "meta": _slim_static(srep),
+                   "version": 1, "status": "approved"},
+        "exec": {"markdown": executor.markdown_report(out), "meta": _slim_exec(out),
+                 "version": 1, "status": "approved"},
+    }
+    versions = {k: v["version"] for k, v in arts.items()}
+    return assemble_report(arts, name, versions,
+                           history={"static": [arts["static"]], "exec": [arts["exec"]]},
+                           coverage_min=config.COVERAGE_BRANCH_MIN)
+
+
+# ---------------- 多目标机（v2）----------------
+# frame_write 里按字节写 CRC：高字节在前，是与字节序无关的正确写法。
+ENDIAN_GOOD = """    out[len + 3] = (uint8_t)(crc >> 8);
+    out[len + 4] = (uint8_t)(crc & 0xFFu);"""
+
+# 注入的缺陷：先手工翻转字节序，再按本机字节序整字写入。隐含「本机是小端」的假设——
+# 小端目标上落盘字节恰好正确，大端目标上两个字节反了。这是星载软件里最典型的
+# 「宿主机测不出来」的写法，也正是多目标验证要抓的东西。
+ENDIAN_BAD = """    uint16_t wire = (uint16_t)((uint16_t)(crc << 8) | (uint16_t)(crc >> 8));
+    *(uint16_t *)(void *)&out[len + 3] = wire;"""
+
+
+def _bits_endian(tid: str) -> str:
+    t = tgt_tab.by_id(tid)
+    return "%d 位%s" % (t.bits, "大端" if t.endian == "big" else "小端")
+
+
+def step_multi(r, tids: list) -> dict | None:
+    _step("5/6", "多目标执行：同一份源码在各目标机上分别编译 + 运行 + 采覆盖率")
+    if len(tids) < 2:
+        _skip("多目标执行", "只配了 %s；验证机装交叉工具链"
+              "（bash scripts/setup_verify_targets.sh）后设 "
+              "VERIFY_TARGETS=host,arm32,ppc32" % ",".join(tids))
+        return None
+    for tid in tids:
+        t = tgt_tab.by_id(tid)
+        print("        %-6s %-22s %-26s %s" % (tid, t.label, t.cc, _bits_endian(tid)))
+
+    ver = "e2e-multi"
+    out = executor.run_verification(r, PID, ver, S.CODE_FILES, S.TEST_FILES,
+                                    case_ids=S.CASE_IDS,
+                                    branch_min=config.COVERAGE_BRANCH_MIN,
+                                    line_min=config.COVERAGE_LINE_MIN,
+                                    targets=tids)
+    per = out.get("target_results") or {}
+    _check(out.get("targets") == tids, "按配置逐个目标执行 %s" % tids,
+           str(out.get("targets")))
+    _check(out["ok"] is True and out["decision"] == executor.DECISION_NEXT,
+           "%d 个目标全部通过（decision=next）" % len(tids), out.get("reason", ""))
+    _check(all((per.get(t) or {}).get("ran") for t in tids), "每个目标都真跑过",
+           str({t: (per.get(t) or {}).get("status") for t in tids}))
+    for tid in tids:
+        t = per.get(tid) or {}
+        cc = tgt_tab.by_id(tid).cc
+        # 编译器指纹必须与目标表一致：否则「已在 arm32 上验证」只是一句空话
+        _check(str((t.get("env") or {}).get("gcc", "")).startswith(cc),
+               "%s 用的是 %s" % (tid, cc), str((t.get("env") or {}).get("gcc")))
+        _check(str(t.get("workdir", "")).endswith("/" + tid),
+               "%s 有独立工作区" % tid, str(t.get("workdir")))
+        _check((t.get("verdict") or {}).get("build") == "ok"
+               and (t.get("verdict") or {}).get("tests") == "ok"
+               and (t.get("coverage") or {}).get("ok") is True,
+               "%s 构建/用例/覆盖率三项达标" % tid, str(t.get("reason")))
+    cov = out.get("coverage") or {}
+    _check(cov.get("merged_targets") == tids, "覆盖率按全部目标合并",
+           str(cov.get("merged_targets")))
+    _check(set(cov.get("per_target") or {}) == set(tids), "逐目标覆盖率都在")
+    cases = (out.get("tests") or {}).get("results") or []
+    _check(bool(cases) and all(set(c.get("per_target") or {}) == set(tids)
+                               for c in cases),
+           "%d 条用例每条都带逐目标结论" % len(cases))
+
+    # 证据目录布局由 archive_evidence 说了算（p<项目号>/v<版本号>），这里按它的返回值找，
+    # 不让脚本自己拼路径——两处各拼一份，迟早走岔。
+    ev_path = executor.archive_evidence(out, PID, ver)
+    ev_dir = (Path(ev_path).parent if ev_path else
+              Path(config.VERIFY_EVIDENCE_DIR) / ("p%d" % PID) / ("v%s" % ver))
+    got = sorted(p.name for p in ev_dir.iterdir()) if ev_dir.is_dir() else []
+    _check(all((ev_dir / ("%s.log" % t)).is_file()
+               and (ev_dir / ("%s.log" % t)).stat().st_size > 0 for t in tids),
+           "逐目标原始输出各自落盘且非空", str(got))
+
+    data = _assemble(out, "通信协议样例模块（多目标 E2E）")
+    _check((data.get("conclusion") or {}).get("pass") is True, "多目标测评结论：通过",
+           str((data.get("conclusion") or {}).get("reasons")))
+    tg = data.get("targets") or {}
+    _check(tg.get("multi") is True and tg.get("ids") == tids, "报告出目标机矩阵",
+           str(tg.get("ids")))
+    md = report_markdown(data)
+    _check("#### 3.1.1 目标机矩阵" in md and "为什么要测这些目标" in md,
+           "报告写清矩阵与选型理由")
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    xx = str(OUT_DIR / "e2e_report_multi.xlsx")
+    export_report_excel(data, xx)
+    try:
+        from openpyxl import load_workbook
+        sheets = load_workbook(xx).sheetnames
+        _check("目标机矩阵" in sheets, "xlsx 附表含「目标机矩阵」", str(sheets))
+    except Exception as e:
+        _check(False, "多目标 xlsx 可打开", repr(e))
+    return out
+
+
+def step_endian_defect(r, tids: list) -> None:
+    _step("6/6", "跨架构缺陷注入：隐含小端假设 → 只在大端目标上暴露")
+    big = [t for t in tids if tgt_tab.by_id(t).endian == "big"]
+    little = [t for t in tids if t not in big]
+    if len(tids) < 2 or not big:
+        _skip("跨架构缺陷注入", "当前目标机 %s 里没有大端架构；"
+              "加上 ppc32 才能验这一条" % ",".join(tids))
+        return
+    bad_c = S.COMM_C.replace(ENDIAN_GOOD, ENDIAN_BAD)
+    if not _check(bad_c != S.COMM_C, "缺陷注入命中 frame_write 的 CRC 写字节序"):
+        return
+    out = executor.run_verification(r, PID, "e2e-endian",
+                                    {**S.CODE_FILES, "src/comm.c": bad_c},
+                                    S.TEST_FILES, case_ids=S.CASE_IDS,
+                                    branch_min=config.COVERAGE_BRANCH_MIN,
+                                    line_min=config.COVERAGE_LINE_MIN,
+                                    targets=tids)
+    per = out.get("target_results") or {}
+    _check(out["ok"] is False, "缺陷被检出（整体不通过）", out.get("reason", ""))
+    _check((out.get("verdict") or {}).get("build") == "ok",
+           "构建仍通过：这是语义错，不是编译错")
+    for tid in little:
+        _check((per.get(tid) or {}).get("ok") is True,
+               "%s（%s）仍通过" % (tid, _bits_endian(tid)),
+               str((per.get(tid) or {}).get("reason")))
+    for tid in big:
+        t = per.get(tid) or {}
+        _check(t.get("ok") is False and bool((t.get("tests") or {}).get("failed")),
+               "%s（%s）用例失败 %s 条" % (tid, _bits_endian(tid),
+                                          (t.get("tests") or {}).get("failed")),
+               str(t.get("reason")))
+    dec = executor.auto_decision(out)
+    _check(bool(dec) and dec[0] == executor.DECISION_FIX_CODE,
+           "确定性归因判为被测代码缺陷", str(dec))
+    _check(bool(dec) and "可移植性" in dec[1] and "字节序" in dec[1],
+           "归因写明可移植性（字节序），且禁止改测试判据绕过",
+           (dec or ("", ""))[1])
+    brief = executor.failure_brief(out)
+    _check(all(t in brief for t in big) and "host" in brief,
+           "失败摘要先给逐目标一行结论并点名大端目标 %s" % big)
+    print("        归因：" + ((dec or ("", "-"))[1][:120]))
+
+
 def main() -> int:
     print("航天嵌入式 AI 自动化代码验证系统 —— 判据层端到端验收")
     print("验证机：%s@%s:%s　工作区根：%s"
@@ -192,6 +352,13 @@ def main() -> int:
     if r is None:
         print("\n[中止] 无法构造 runner。检查 .env 的 VERIFY_* 配置。")
         return 2
+    try:
+        tids = tgt_tab.ids(sys.argv[1] if len(sys.argv) > 1 else None)
+    except tgt_tab.TargetError as e:
+        print("\n[中止] %s" % e)
+        return 2
+    print("目标机：%s%s" % (", ".join(tids),
+                          "" if len(sys.argv) > 1 else "（取自 .env 的 VERIFY_TARGETS）"))
 
     try:
         if not step_probe(r):
@@ -200,6 +367,8 @@ def main() -> int:
         green = step_green(r)
         step_defect(r)
         step_deliverables(r, green)
+        step_multi(r, tids)
+        step_endian_defect(r, tids)
     except Exception as e:
         import traceback
         print("\n[异常] " + type(e).__name__ + ": " + str(e))
@@ -207,12 +376,17 @@ def main() -> int:
         return 1
 
     print("\n" + "=" * 56)
+    if _SKIPS:
+        print("跳过 %d 项（未配置对应目标机，不算通过也不算失败）：" % len(_SKIPS))
+        for s in _SKIPS:
+            print("  - " + s)
     if _FAILS:
         print("验收未通过：%d 项失败" % len(_FAILS))
         for f in _FAILS:
             print("  - " + f)
         return 1
-    print("验收通过：判据层在真实验证机上全链路达标（绿跑 + 缺陷检出 + 交付件）。")
+    print("验收通过：判据层在真实验证机上全链路达标"
+          "（绿跑 + 缺陷检出 + 交付件 + 多目标 %s）。" % ", ".join(tids))
     return 0
 
 

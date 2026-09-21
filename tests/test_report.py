@@ -368,6 +368,197 @@ def test_report_consumes_real_executor_outcome():
     assert synced["src/comm.c"]["sha256"] == _sha(SAMPLE.COMM_C)
 
 
+# ================= 多目标执行（v2）：矩阵 / 渲染 / 导出 =================
+def _multi_exec(spec="host,arm32,ppc32", **kw):
+    """真实 executor 的多目标产物，按 pipeline.nodes._slim_exec 的口径精简入库。
+
+    刻意不手搓 meta：报告层直接吃执行层跑出来的东西，两层形状一旦漂移这里就红。
+    kw 透传给 tests.test_executor._multi（per / probe_missing / branch_min）。"""
+    from tests import test_executor as TEX
+    from pipeline import nodes
+    out, _runner = TEX._multi(spec, **kw)
+    slim = nodes._slim_exec(out)
+    slim["evidence"] = "data/verify/p1/v1mt/exec.log"
+    return slim
+
+
+MULTI_GREEN = None          # 延迟构造：单目标用例不该被多目标夹具的导入开销拖累
+
+
+def _multi_green():
+    global MULTI_GREEN
+    if MULTI_GREEN is None:
+        MULTI_GREEN = _multi_exec()
+    return MULTI_GREEN
+
+
+def test_targets_section_matrix_from_real_multi_target_run():
+    """矩阵每一行的字长/字节序/编译器/qemu/为何要测，都必须落到位。"""
+    data = assemble(make_arts(exec_meta=_multi_green()))
+    tg = data["targets"]
+    assert tg["multi"] is True
+    assert tg["ids"] == ["host", "arm32", "ppc32"]
+    rows = {r["id"]: r for r in tg["rows"]}
+    assert set(rows) == {"host", "arm32", "ppc32"}
+    for r in tg["rows"]:
+        for key in ("label", "bits", "endian", "cc", "run", "build_text",
+                    "tests_text", "coverage_text", "why"):
+            assert r.get(key), f"{r['id']} 缺 {key}"
+        assert r["ran"] is True and r["ok"] is True
+        assert (r["build_text"], r["tests_text"], r["coverage_text"]) == ("通过",) * 3
+    assert rows["host"]["bits"] == 64 and rows["host"]["endian"] == "小端"
+    assert rows["host"]["run"] == "本机直接执行"
+    assert rows["ppc32"]["bits"] == 32 and rows["ppc32"]["endian"] == "大端"
+    assert "qemu-ppc-static" in rows["ppc32"]["run"]
+    assert rows["arm32"]["cc"] == "arm-linux-gnueabihf-gcc"
+    # 逐目标工具链指纹来自 target_env，不是报告层现编的
+    assert rows["ppc32"]["gcc"].startswith("powerpc-linux-gnu-gcc")
+
+
+def test_targets_section_single_target_is_not_multi():
+    """既有单目标产物：不画矩阵，否则审阅的人会以为做过跨架构验证。"""
+    tg = assemble(make_arts())["targets"]
+    assert tg["multi"] is False and tg["rows"] == []
+
+
+def test_targets_section_single_cross_target_keeps_facts():
+    """只配了一个交叉目标：仍不是矩阵（multi=False），但目标事实要留全。"""
+    tg = assemble(make_arts(exec_meta=_multi_exec("arm32")))["targets"]
+    assert tg["multi"] is False and tg["ids"] == ["arm32"]
+    assert len(tg["rows"]) == 1
+    r = tg["rows"][0]
+    assert r["endian"] == "小端" and r["cc"] == "arm-linux-gnueabihf-gcc"
+    assert "qemu-arm-static" in r["run"]
+
+
+def test_conclusion_multi_all_green_passes():
+    data = assemble(make_arts(exec_meta=_multi_green()))
+    assert data["conclusion"]["pass"] is True
+    assert data["conclusion"]["reasons"] == []
+    assert "全部通过" in data["conclusion"]["text"]
+    # 多目标产物照样能喂进追溯矩阵：每条需求的执行结论仍是「通过」
+    assert data["trace"]["status_counts"].get("ok") == 2
+
+
+def test_conclusion_multi_one_target_fail_is_not_pass():
+    """两个目标绿、一个大端目标挂：整体必须判不通过，并点名是哪个目标。"""
+    em = _multi_exec(per={"ppc32": {"fails": ("TC-007",)}})
+    data = assemble(make_arts(exec_meta=em))
+    assert data["conclusion"]["pass"] is False
+    assert any("验证执行未通过" in r for r in data["conclusion"]["reasons"])
+    rows = {r["id"]: r for r in data["targets"]["rows"]}
+    assert rows["ppc32"]["tests_text"] == "不通过"
+    assert rows["host"]["tests_text"] == "通过"
+    md = REX.report_markdown(data)
+    line = [x for x in md.splitlines() if x.startswith("| TC-007 ")][0]
+    assert "ppc32" in line and "失败" in line
+    assert "host" not in line            # 通过的目标不点名，格子只给落点
+
+
+def test_conclusion_multi_unavailable_target_is_not_pass():
+    """验证机没装某目标的交叉工具链：结论是「未验证」，转人工，不得静默放行。"""
+    em = _multi_exec(probe_missing=("ppc32",))
+    data = assemble(make_arts(exec_meta=em))
+    assert data["conclusion"]["pass"] is False
+    rows = {r["id"]: r for r in data["targets"]["rows"]}
+    assert rows["ppc32"]["ran"] is False
+    assert rows["ppc32"]["build_text"] == "未执行"
+    assert "powerpc-linux-gnu-gcc" in rows["ppc32"]["reason"]
+    # 其余目标仍全绿，但整轮不放行
+    assert rows["host"]["tests_text"] == "通过"
+
+
+def test_coverage_multi_takes_worst_not_average():
+    """逐目标覆盖率要摊开给人看，汇总数字取最差值而不是被其他目标摊平。"""
+    em = _multi_exec(per={"arm32": {"cov": "low"}})
+    data = assemble(make_arts(exec_meta=em))
+    cov = data["coverage"]
+    assert cov["merged_targets"] == ["host", "arm32", "ppc32"]
+    assert cov["ok"] is False
+    assert cov["totals"]["branch_pct"] < 80.0
+    assert set(cov["per_target"]) == {"host", "arm32", "ppc32"}
+    assert cov["per_target"]["arm32"]["ok"] is False
+    assert cov["per_target"]["host"]["ok"] is True
+    md = REX.report_markdown(data)
+    assert "逐目标总体覆盖率" in md and "arm32" in md
+
+
+def test_environment_multi_records_each_target_toolchain():
+    env = assemble(make_arts(exec_meta=_multi_green()))["environment"]
+    assert env["targets"] == ["host", "arm32", "ppc32"]
+    assert "host:" in env["gcc"] and "arm32:" in env["gcc"]
+    tenv = env["target_env"]
+    assert tenv["ppc32"]["qemu"] == "qemu-ppc-static"
+    assert tenv["host"]["qemu"] == "none"
+    assert env["target_probe"]["arm32"]["ok"] is True
+
+
+def test_per_target_cases_names_only_failed_targets():
+    assert REX._per_target_cases({}) == "-"
+    assert REX._per_target_cases({"host": "pass", "arm32": "pass"}) == "2 个目标全部通过"
+    cell = REX._per_target_cases({"host": "pass", "arm32": "fail", "ppc32": "missing"})
+    assert "arm32 失败" in cell and "ppc32 未执行" in cell
+    assert "host" not in cell
+
+
+def test_markdown_multi_target_has_matrix_and_rationale():
+    md = REX.report_markdown(assemble(make_arts(exec_meta=_multi_green())))
+    assert "#### 3.1.1 目标机矩阵" in md
+    assert "为什么要测这些目标" in md
+    assert "最差值" in md                 # 汇总口径写在报告里，不靠口头约定
+    assert "多目标执行" in md             # 3.2 测评方法第 5 条
+    assert "| 用例编号 | 结果 | 各目标机 | 说明 |" in md
+    assert "大端" in md and "qemu-ppc-static" in md
+
+
+def test_markdown_single_target_has_no_matrix():
+    md = REX.report_markdown(assemble(make_arts()))
+    assert "3.1.1 目标机矩阵" not in md
+    assert "各目标机" not in md
+    assert "多目标执行" not in md
+    assert "| 用例编号 | 结果 | 说明 |" in md
+
+
+def test_export_excel_multi_has_target_sheet():
+    from openpyxl import load_workbook
+    data = assemble(make_arts(exec_meta=_multi_green()))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp) / "report_multi.xlsx")
+        REX.export_report_excel(data, path)
+        wb = load_workbook(path)
+        assert "目标机矩阵" in wb.sheetnames
+        ws = wb["目标机矩阵"]
+        rows = [[c.value for c in r] for r in ws.iter_rows(min_row=2)]
+        assert [r[0] for r in rows] == ["host", "arm32", "ppc32"]
+        assert "大端" in [r[3] for r in rows]
+        # 用例表多出「各目标机」列，结论页写清目标数与汇总口径
+        cases = [[c.value for c in r] for r in wb["用例结果"].iter_rows()]
+        assert cases[0][:4] == ["用例编号", "结果", "各目标机", "说明"]
+        concl = {r[0].value: r[1].value
+                 for r in wb["测评结论"].iter_rows(min_row=2)}
+        assert "3 个" in concl["目标机"] and "最差值" in concl["目标机"]
+
+
+def test_export_excel_single_target_has_no_target_sheet():
+    from openpyxl import load_workbook
+    data = assemble(make_arts())
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp) / "report_single.xlsx")
+        REX.export_report_excel(data, path)
+        wb = load_workbook(path)
+        assert "目标机矩阵" not in wb.sheetnames
+        cases = [[c.value for c in r] for r in wb["用例结果"].iter_rows()]
+        assert cases[0][:3] == ["用例编号", "结果", "说明"]
+
+
+def test_export_docx_multi_target_creates_file():
+    data = assemble(make_arts(exec_meta=_multi_green()))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp) / "report_multi.docx")
+        REX.export_report_docx(data, path)
+        assert os.path.getsize(path) > 0
+
+
 def _main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

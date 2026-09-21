@@ -131,7 +131,7 @@ def select_baseline(arts: dict) -> dict:
     base = {"tag": "", "exec_version": None, "exec_status": "", "exec_ok": None,
             "exec_skipped": False, "code_version": None, "test_version": None,
             "source": "", "reason": "", "manifest": {}, "evidence": "", "env": {},
-            "verdict": {}, "commands": [], "warnings": []}
+            "verdict": {}, "commands": [], "targets": [], "warnings": []}
     warn = base["warnings"]
 
     last = execs[-1] if execs else None
@@ -147,7 +147,8 @@ def select_baseline(arts: dict) -> dict:
                      "evidence": str(meta.get("evidence") or ""),
                      "env": meta.get("env") or {},
                      "verdict": meta.get("verdict") or {},
-                     "commands": meta.get("commands") or []})
+                     "commands": meta.get("commands") or [],
+                     "targets": meta.get("targets") or []})
         if cv in codes:
             base["code_version"] = cv
             base["test_version"] = tv if tv in tests else None
@@ -340,7 +341,14 @@ def _plan_evidence(arts: dict, project_id: int, evidence_root, warnings: list) -
         src_dir = Path(recorded).parent if recorded else (
             root / f"p{project_id}" / f"v{tag}" if root else None)
         files = []
-        for fname in ("exec.log", "exec.json"):
+        # 多目标机时每个跑过的目标另有一份原始输出，同样必须进包：汇总结论取的是
+        # 各目标最差值，争议往往落在「到底是哪个架构上挂的」。期望文件从产物 meta 的
+        # target_results 推，旧产物没有该字段，自然退化成 exec.log + exec.json。
+        ran = [tid for tid, t in (meta.get("target_results") or {}).items()
+               if (t or {}).get("ran")]
+        names = ["exec.log", "exec.json"] + (
+            [f"{tid}.log" for tid in ran] if len(ran) > 1 else [])
+        for fname in names:
             src = (src_dir / fname) if src_dir else None
             exists = bool(src and src.is_file())
             files.append({"name": fname, "src": str(src) if src else "",
@@ -506,6 +514,23 @@ def zip_bundle(tree_dir, zip_path=None) -> str:
 
 
 # ---------------- 包清单（人读的那一份） ----------------
+def _repro_cmd(c: dict) -> str:
+    """一条可照抄复现的命令行（多目标时标出是哪个目标）。
+
+    真实记录里的 cmd 本身已经是 `cd <cwd> && sh build.sh`，再按 cwd 补一行 cd
+    就会把同一个 cd 印两遍；多目标时三条命令长得一模一样，不标目标就看不出
+    哪一行复现哪个架构。退出码一并印出来，复核时能对上证据里的结论。"""
+    cmd = str(c.get("cmd") or "").strip() or "sh build.sh"
+    cwd = str(c.get("cwd") or "").strip()
+    if cwd and not cmd.startswith("cd "):
+        cmd = f"cd {cwd} && {cmd}"
+    tid = str(c.get("target") or "").strip()
+    head = f"# 目标机 {tid}\n" if tid else ""
+    code = c.get("exit_code")
+    tail = "" if code is None else f"\n# 当时退出码 {code}"
+    return head + cmd + tail
+
+
 def _short(sha) -> str:
     return f"{str(sha or '')[:16]}…" if sha else "-"
 
@@ -615,11 +640,24 @@ def manifest_markdown(plan: dict, hashed: dict) -> str:
           "2. 在 Linux（gcc + gcov）下执行 `sh build.sh`；",
           "3. 输出中 `WB_SECTION run` 是用例结果（`TC-xxx PASS/FAIL`），"
           "`WB_SECTION coverage` 是 gcov 覆盖率；",
-          "4. 与 `04_证据/` 里对应轮次的 `exec.log` 比对即可复核结论。", ""]
+          "4. 与 `04_证据/` 里对应轮次的 `exec.log` 比对即可复核结论。"]
+    tgt_ids = (plan.get("baseline") or {}).get("targets") or []
+    if len(tgt_ids) > 1:
+        # 说清楚包内 build.sh 只能复现哪一个目标：否则「已在 N 个目标上验证」
+        # 的结论会被误当成「照包内脚本跑一遍就能全部复现」。
+        L += ["",
+              f"> **目标机矩阵**：本轮结论来自 {len(tgt_ids)} 个目标机"
+              f"（{'、'.join(str(x) for x in tgt_ids)}），汇总取各目标最差值。",
+              f"> 包内 `{DIR_SOURCE}/build.sh` 是验证机本机（host）变体，"
+              "按上述步骤只复现 host 目标；其余目标需用对应交叉编译器与 "
+              "`qemu-<arch>-static` 重新生成构建脚本"
+              "（`verification/buildkit.py` 的 `build_script(target)`），"
+              f"各目标原始输出见 `{DIR_EVIDENCE}/` 内的 `<目标id>.log`。"]
+    L.append("")
     cmds = (base.get("commands") or [])
     if cmds:
         L += ["执行时的命令行：", ""]
-        L += [f"```sh\ncd {c.get('cwd', '-')}\n{c.get('cmd', '-')}\n```" for c in cmds]
+        L += [f"```sh\n{_repro_cmd(c)}\n```" for c in cmds]
         L += [""]
 
     L += ["## 七、完整性校验", "",

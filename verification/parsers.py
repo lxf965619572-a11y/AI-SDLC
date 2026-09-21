@@ -441,3 +441,222 @@ def summarize_coverage(parsed: dict, branch_min: float = 0.0,
                and (branch_pct is None or branch_pct >= branch_min)
                and (line_pct is None or line_pct >= line_min)),
     }
+
+
+# ---------------- 跨目标合并 ----------------
+# 为什么放在 parsers 而不是 executor：tests / coverage 两个字典的形状由本模块定义，
+# 合并规则必须与产生规则同源，否则「单目标结论」和「多目标汇总结论」会各说一套。
+
+_ST_RANK = {ST_PASS: 0, ST_MISSING: 1, ST_FAIL: 2}      # 越大越坏
+
+
+def merge_tests(per_target: dict) -> dict:
+    """跨目标合并用例结论：一条用例必须在**每个**目标上都通过才算通过。
+
+    取最差而不是取多数——host 全过、ppc32 挂一条，说明代码里藏着字节序假设，
+    这正是换目标机要抓的东西；按多数表决恰好会把它投掉。
+    detail 里点名是哪个目标挂的，归因智能体据此能直接判方向。
+    """
+    tids = list(per_target)
+    order: list = []
+    for tid in tids:
+        for cid in (per_target[tid].get("expected") or []):
+            if cid not in order:
+                order.append(cid)
+        for r in per_target[tid].get("results") or []:
+            if r.get("id") and r["id"] not in order:
+                order.append(r["id"])
+
+    results = []
+    for cid in order:
+        fails, misses, detail, statuses = [], [], "", {}
+        for tid in tids:
+            r = (per_target[tid].get("by_id") or {}).get(cid)
+            if r is None:
+                misses.append(tid)
+                statuses[tid] = ST_MISSING
+                detail = detail or "该目标未输出这条用例的结果"
+            else:
+                statuses[tid] = r.get("status")
+                if r.get("status") == ST_FAIL:
+                    fails.append(tid)
+                    detail = detail or str(r.get("detail") or "")
+                elif r.get("status") == ST_MISSING:
+                    misses.append(tid)
+                    detail = detail or str(r.get("detail") or "")
+                elif not detail:
+                    detail = str(r.get("detail") or "")
+        if fails:
+            status, prefix = ST_FAIL, f"[{'、'.join(fails)} 失败] "
+        elif misses:
+            status, prefix = ST_MISSING, f"[{'、'.join(misses)} 未执行] "
+        else:
+            status, prefix = ST_PASS, ""
+        results.append({"id": cid, "status": status,
+                        "status_text": STATUS_TEXT.get(status, status),
+                        "detail": (prefix + detail).strip(),
+                        "per_target": statuses})
+
+    n_pass = sum(1 for r in results if r["status"] == ST_PASS)
+    n_fail = sum(1 for r in results if r["status"] == ST_FAIL)
+    n_miss = sum(1 for r in results if r["status"] == ST_MISSING)
+    exits = [per_target[t].get("run_exit") for t in tids]
+    bad_exit = next((e for e in exits if e not in (None, 0, 1)), None)
+    return {
+        "results": results,
+        "by_id": {r["id"]: r for r in results},
+        "expected": order,
+        "total": len(results),
+        "passed": n_pass, "failed": n_fail, "missing": n_miss,
+        "reported_total": (sum(per_target[t].get("reported_total") or 0 for t in tids)
+                           if all(per_target[t].get("reported_total") is not None
+                                  for t in tids) else None),
+        "reported_failed": (sum(per_target[t].get("reported_failed") or 0 for t in tids)
+                            if all(per_target[t].get("reported_failed") is not None
+                                   for t in tids) else None),
+        "run_exit": bad_exit if bad_exit is not None else (exits[0] if exits else None),
+        "crashed": any(per_target[t].get("crashed") for t in tids),
+        # 任一目标的桩自报数与解析数对不上，就说明桩本身有问题，汇总同样不可信
+        "consistent": all(per_target[t].get("consistent", True) for t in tids),
+        "all_pass": bool(results) and n_fail == 0 and n_miss == 0
+                    and not any(per_target[t].get("crashed") for t in tids),
+        "per_target": {t: {"total": per_target[t].get("total"),
+                           "passed": per_target[t].get("passed"),
+                           "failed": per_target[t].get("failed"),
+                           "missing": per_target[t].get("missing"),
+                           "all_pass": per_target[t].get("all_pass")} for t in tids},
+    }
+
+
+def _min_opt(rows: list, key: str, n: int, pad: float = 0.0):
+    """各目标取最小值。所有目标都没有该指标时保持 None（如无分支函数的 branch_pct）；
+    某个目标缺这条记录时按 pad 计——缺证据不等于达标。"""
+    present = [r.get(key) for r in rows]
+    if len(rows) == n and all(v is None for v in present):
+        return None
+    vals = [pad if v is None else float(v) for v in present]
+    vals.extend([pad] * max(0, n - len(rows)))
+    return min(vals) if vals else None
+
+
+def _max_int(rows: list, key: str) -> int:
+    vals = [int(r.get(key) or 0) for r in rows]
+    return max(vals) if vals else 0
+
+
+def _min_int(rows: list, key: str, n: int) -> int:
+    vals = [int(r.get(key) or 0) for r in rows]
+    vals.extend([0] * max(0, n - len(rows)))
+    return min(vals) if vals else 0
+
+
+def merge_coverage(per_target: dict, branch_min: float = 0.0,
+                   line_min: float = 0.0) -> dict:
+    """跨目标合并覆盖率：逐函数、逐文件取各目标最差值，再由最差值重算总体。
+
+    口径说明：只合并**真正跑出覆盖率**的目标（构建失败的目标没有覆盖率可言，
+    由调用方排除并在结论里单独记名）。总体百分比由合并后的文件级计数重新加权，
+    而不是对各目标百分比取平均——平均会让小文件与核心模块权重相同。
+    """
+    tids = list(per_target)
+    n = len(tids)
+
+    fkeys: list = []
+    for tid in tids:
+        for d in per_target[tid].get("functions") or []:
+            if d.get("key") and d["key"] not in fkeys:
+                fkeys.append(d["key"])
+    functions = []
+    for key in fkeys:
+        rows = [d for tid in tids
+                for d in (per_target[tid].get("functions") or []) if d.get("key") == key]
+        base = dict(rows[0])
+        absent = [tid for tid in tids
+                  if not any(d.get("key") == key
+                             for d in (per_target[tid].get("functions") or []))]
+        base["lines_pct"] = _min_opt(rows, "lines_pct", n)
+        base["branch_pct"] = _min_opt(rows, "branch_pct", n)
+        base["branch_effective"] = _min_opt(rows, "branch_effective", n, 0.0)
+        base["calls_pct"] = _min_opt(rows, "calls_pct", n)
+        base["lines_total"] = _max_int(rows, "lines_total")
+        base["lines_hit"] = _min_int(rows, "lines_hit", n)
+        base["branch_total"] = _max_int(rows, "branch_total")
+        base["branch_taken"] = _min_int(rows, "branch_taken", n)
+        base["never_executed"] = any(bool(r.get("never_executed")) for r in rows) or bool(absent)
+        base["no_branches"] = (len(rows) == n
+                               and all(bool(r.get("no_branches")) for r in rows))
+        base["in_scope"] = any(bool(r.get("in_scope", True)) for r in rows)
+        base["absent_in"] = absent
+        base["per_target"] = {
+            tid: next(({"lines_pct": d.get("lines_pct"),
+                        "branch_effective": d.get("branch_effective")}
+                       for d in (per_target[tid].get("functions") or [])
+                       if d.get("key") == key), None)
+            for tid in tids}
+        functions.append(base)
+    functions.sort(key=lambda d: d["key"])
+
+    fnames: list = []
+    for tid in tids:
+        for d in per_target[tid].get("files") or []:
+            if d.get("name") and d["name"] not in fnames:
+                fnames.append(d["name"])
+    src_files = []
+    for name in fnames:
+        rows = [d for tid in tids
+                for d in (per_target[tid].get("files") or []) if d.get("name") == name]
+        src_files.append({
+            "kind": rows[0].get("kind", "file"), "name": name,
+            "file": rows[0].get("file", name),
+            "lines_pct": _min_opt(rows, "lines_pct", n),
+            "lines_total": _max_int(rows, "lines_total"),
+            "lines_hit": _min_int(rows, "lines_hit", n),
+            "branch_pct": _min_opt(rows, "branch_pct", n),
+            "branch_total": _max_int(rows, "branch_total"),
+            "branch_taken": _min_int(rows, "branch_taken", n),
+            "branch_effective": _min_opt(rows, "branch_effective", n, 0.0),
+            "calls_pct": _min_opt(rows, "calls_pct", n),
+            "calls_total": _max_int(rows, "calls_total"),
+            "no_branches": (len(rows) == n
+                            and all(bool(r.get("no_branches")) for r in rows)),
+            "never_executed": any(bool(r.get("never_executed")) for r in rows),
+            "absent_in": [tid for tid in tids
+                          if not any(d.get("name") == name
+                                     for d in (per_target[tid].get("files") or []))],
+        })
+    src_files.sort(key=lambda d: d["name"])
+
+    tot_lines = sum(d["lines_total"] for d in src_files)
+    hit_lines = sum(d["lines_hit"] for d in src_files)
+    tot_br = sum(d["branch_total"] for d in src_files)
+    taken_br = sum(d["branch_taken"] for d in src_files)
+    line_pct = (100.0 * hit_lines / tot_lines) if tot_lines else None
+    branch_pct = (100.0 * taken_br / tot_br) if tot_br else None
+
+    gated = [d for d in functions if d.get("in_scope", True)]
+    below_branch = [d["key"] for d in gated
+                    if d["branch_total"] and (d["branch_effective"] or 0.0) < branch_min]
+    below_line = [d["key"] for d in gated
+                  if d["lines_total"] and (d["lines_pct"] or 0.0) < line_min]
+    untested = [d["key"] for d in gated
+                if d["never_executed"]
+                or (d["lines_total"] and (d["lines_pct"] or 0.0) <= 0.0)]
+    return {
+        "functions": functions,
+        "function_map": {d["name"]: d for d in functions},
+        "files": src_files,
+        "totals": {"lines_total": tot_lines, "lines_hit": hit_lines,
+                   "line_pct": line_pct,
+                   "branch_total": tot_br, "branch_taken": taken_br,
+                   "branch_pct": branch_pct},
+        "thresholds": {"branch_min": branch_min, "line_min": line_min},
+        "below_branch": sorted(below_branch),
+        "below_line": sorted(below_line),
+        "untested_functions": sorted(untested),
+        "merged_targets": tids,
+        "per_target": {t: {"totals": per_target[t].get("totals"),
+                           "ok": per_target[t].get("ok")} for t in tids},
+        "ok": (not below_branch and not below_line and not untested
+               and (branch_pct is None or branch_pct >= branch_min)
+               and (line_pct is None or line_pct >= line_min)),
+    }

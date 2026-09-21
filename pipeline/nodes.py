@@ -214,6 +214,10 @@ def _make_compile_check(project_id: int, stage: str, session=None,
     链接通过才说明测试程序真能跑起来，只编不链会把缺 main、符号未定义这类问题
     留到执行阶段才暴露，那时已经浪费了一整轮同步与覆盖率采集。
     未配置验证机时 compile_probe 返回 skipped=True，离线/mock 模式照常往下走。
+
+    配了多个目标机时逐个交叉编译校验。某个目标的交叉工具链没装属于**环境问题**
+    而不是代码问题：本阶段只记 WARN 不拦（重生也变不出编译器），真正的拦截发生在
+    执行验证节点——那里会因该目标未验证而整轮转人工。
     """
     link = stage == "test_impl"
 
@@ -222,19 +226,29 @@ def _make_compile_check(project_id: int, stage: str, session=None,
             runner_from_config(), project_id,
             code_files if link else files,
             files if link else None,
-            stage=stage)
+            stage=stage, targets=config.VERIFY_TARGETS)
         if session is not None:
             what = "编译并链接" if link else "编译"
-            if probe.get("skipped"):
-                log(session, project_id, f"未配置验证机，跳过远端{what}校验",
+            tgts = probe.get("targets") or []
+            scope = (f"（{len(tgts)} 个目标机：{'、'.join(tgts)}）"
+                     if len(tgts) > 1 else "")
+            if probe.get("unavailable"):
+                log(session, project_id,
+                    f"目标机工具链缺失，本阶段未校验：{probe['unavailable']}",
                     stage, "WARN")
+            if probe.get("skipped"):
+                # 跳过原因由 executor 给准（未配置验证机 / 工具链缺失），
+                # 这里只兜底；措辞含糊会让评审的人以为是代码编不过。
+                why = (probe.get("reason") or "").replace("（WARN）", "").strip()
+                log(session, project_id,
+                    why or f"未配置验证机，跳过远端{what}校验", stage, "WARN")
             elif probe.get("ok"):
                 log(session, project_id,
-                    f"远端{what}通过（退出码 {probe.get('exit_code')}）", stage)
+                    f"远端{what}通过{scope}（退出码 {probe.get('exit_code')}）", stage)
             else:
                 tail = "\n".join((probe.get("log") or "").strip().splitlines()[-12:])
                 log(session, project_id,
-                    f"远端{what}未通过，回灌工具输出重新生成：\n{tail}",
+                    f"远端{what}未通过{scope}，回灌工具输出重新生成：\n{tail}",
                     stage, "WARN")
         return probe
 
@@ -416,6 +430,37 @@ def _slim_static(report: dict) -> dict:
     return {k: v for k, v in (report or {}).items() if k != "rule_table"}
 
 
+def _slim_target(t: dict) -> dict:
+    """单个目标机结论的入库精简版。
+
+    逐目标的原始输出与构建日志全文都已落证据目录（多目标时另有 `<目标id>.log`），
+    库里只留可判定的事实与计数器：这些字段按目标数翻倍，全量入库会把 SQLite
+    撑到几十兆，前端轮询状态也跟着变慢。"""
+    t = t or {}
+    build, tests = t.get("build") or {}, t.get("tests") or {}
+    cov = t.get("coverage") or {}
+    man = t.get("manifest") or {}
+    out = {k: t.get(k) for k in
+           ("target", "status", "ran", "available", "ok", "no_source",
+            "reason", "error", "verdict", "facts", "probe",
+            "workdir", "exit_code", "transport")}
+    out["build"] = {"ok": build.get("ok"),
+                    "warning_count": len(build.get("warnings") or []),
+                    "errors": (build.get("errors") or [])[:10],
+                    "log_tail": _tail_lines(build.get("log"), 20)}
+    out["tests"] = {k: tests.get(k) for k in
+                    ("total", "passed", "failed", "missing", "all_pass",
+                     "crashed", "run_exit", "consistent")}
+    out["coverage"] = {"ok": cov.get("ok"), "totals": cov.get("totals") or {},
+                       "below_branch": cov.get("below_branch") or [],
+                       "untested_functions": cov.get("untested_functions") or []}
+    # 顶层 manifest 是按 host 构建脚本算出的源码基线指纹；各目标实际同步的
+    # 构建脚本指纹不同（注入的编译器与 qemu 不一样），这里只留可核对的摘要。
+    out["manifest"] = {"files": len(man),
+                       "build_sh_sha256": (man.get("build.sh") or {}).get("sha256")}
+    return {k: v for k, v in out.items() if v is not None}
+
+
 def _slim_exec(outcome: dict) -> dict:
     """执行结论入库精简版：原始日志已落证据目录，库里只留可判定的部分。"""
     drop = ("raw_log", "run_section", "coverage_section", "synced_files")
@@ -425,6 +470,10 @@ def _slim_exec(outcome: dict) -> dict:
                      "warning_count": len(build.get("warnings") or []),
                      "errors": build.get("errors") or [],
                      "log_tail": _tail_lines(build.get("log"), 40)}
+    per_target = (outcome or {}).get("target_results") or {}
+    if per_target:
+        slim["target_results"] = {tid: _slim_target(t)
+                                  for tid, t in per_target.items()}
     return slim
 
 
@@ -594,15 +643,41 @@ def exec_node(state: PipelineState) -> dict:
             f"开始远端验证：代码 v{code.version} + 测试 v{ti.version}，"
             f"{len(code_files)} 个源文件、{len(test_files)} 个测试文件、"
             f"{len(case_ids)} 条用例（第 {rounds + 1} 轮）", "exec")
+        # 目标机清单只用于日志与前端进度；配置写错时不静默降级成只测宿主机，
+        # run_verification 会返回 blocked，整轮转人工裁决。
+        try:
+            tgt_ids = config.verify_target_ids()
+        except Exception as e:
+            tgt_ids = []
+            log(session, project_id, f"目标机配置错误：{e}", "exec", "WARN")
+        if len(tgt_ids) > 1:
+            log(session, project_id,
+                f"目标机矩阵 {len(tgt_ids)} 个：{'、'.join(tgt_ids)}"
+                "（同一份源码逐个交叉编译并执行，汇总结论取各目标最差值）", "exec")
 
         outcome = executor.run_verification(
             runner_from_config(), project_id, tag, code_files, test_files,
             case_ids=case_ids, branch_min=config.COVERAGE_BRANCH_MIN,
-            line_min=config.COVERAGE_LINE_MIN)
+            line_min=config.COVERAGE_LINE_MIN, targets=config.VERIFY_TARGETS)
         evidence = executor.archive_evidence(outcome, project_id, tag)
         md = executor.markdown_report(outcome)
         if evidence:
             md += f"\n\n> 完整原始输出与结论已归档：`{evidence}`"
+
+        # 逐目标结论实时落日志：多目标时争议总是「到底哪个架构挂的」，
+        # 汇总结论取最差值，只看总数看不出落点。
+        per_target = outcome.get("target_results") or {}
+        scope = (f"（{len(per_target)} 个目标机：{'、'.join(per_target)}）"
+                 if len(per_target) > 1 else "")
+        if scope:
+            for tid, t in per_target.items():
+                v = t.get("verdict") or {}
+                note = "" if t.get("ok") else (
+                    f" — {t.get('reason') or t.get('error') or '未通过'}")
+                log(session, project_id,
+                    f"目标机 {tid}：构建 {v.get('build')} · 用例 {v.get('tests')} · "
+                    f"覆盖率 {v.get('coverage')}{note}", "exec",
+                    "INFO" if t.get("ok") else "WARN")
 
         ok = bool(outcome.get("ok"))
         blocked = bool(outcome.get("skipped")) or \
@@ -661,19 +736,20 @@ def exec_node(state: PipelineState) -> dict:
         cov = (outcome.get("coverage") or {}).get("totals") or {}
         if ok:
             log(session, project_id,
-                f"验证执行通过：用例 {tests.get('passed')}/{tests.get('expected') or tests.get('total')} 全过，"
+                f"验证执行通过{scope}：用例 {tests.get('passed')}/{tests.get('expected') or tests.get('total')} 全过，"
                 f"行覆盖 {cov.get('line_pct')}%，分支覆盖 {cov.get('branch_pct')}%"
                 f"（门限 {config.COVERAGE_BRANCH_MIN}%），耗时 {outcome.get('duration_s')}s",
                 "exec")
             update["tool_route"] = "next"
         elif blocked:
             log(session, project_id,
-                f"验证未执行：{outcome.get('reason')}，转人工裁决", "exec", "WARN")
+                f"验证未执行{scope}：{outcome.get('reason')}，转人工裁决", "exec", "WARN")
             _set_status(session, project_id, "waiting_review", "exec")
             update["tool_route"] = "gate"
         elif over_limit:
             log(session, project_id,
-                f"验证执行未通过且自动修复已达上限（{rounds} 轮），出问题报告单转人工裁决",
+                f"验证执行未通过{scope}且自动修复已达上限（{rounds} 轮），"
+                "出问题报告单转人工裁决",
                 "exec", "WARN")
             _set_status(session, project_id, "waiting_review", "exec")
             update["tool_route"] = "gate"
@@ -681,7 +757,7 @@ def exec_node(state: PipelineState) -> dict:
             fix_test = decision == executor.DECISION_FIX_TEST
             back = "测试实现" if fix_test else "代码"
             log(session, project_id,
-                f"验证执行未通过（{reason}），回「{back}」阶段重生"
+                f"验证执行未通过{scope}（{reason}），回「{back}」阶段重生"
                 f"（{rounds + 1}/{config.MAX_FIX_ROUNDS} 轮）", "exec", "WARN")
             update["tool_route"] = "fix_test" if fix_test else "fix_code"
             update["retry_comments"] = _exec_feedback(outcome, decision, reason,

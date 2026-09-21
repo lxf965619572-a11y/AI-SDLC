@@ -18,9 +18,13 @@ import time
 from pathlib import Path
 
 from verification import buildkit, parsers
+from verification import targets as tgt_tab
 
 # 原始日志入库上限：SQLite 里存全文便于追溯，但要防住异常输出把库撑爆
 RAW_LOG_LIMIT = 200_000
+
+# 单个目标的结论里另存为 <tid>.log 的大字段：结论文件（exec.json）只留可判定部分
+_TARGET_LOG_KEYS = ("raw_log", "run_section", "coverage_section")
 
 
 def _shq(path: str) -> str:
@@ -49,7 +53,10 @@ def archive_evidence(outcome: dict, project_id: int, version, stage: str = "exec
     """把原始日志与结论落到证据目录，返回相对路径。
 
     为什么既要入库又要落盘：入库的那份会被截断，落盘的是完整原文；
-    出争议时要能拿出未截断的原始输出。"""
+    出争议时要能拿出未截断的原始输出。
+
+    多目标机时每个目标另存一份 `<目标id>.log`：汇总结论取的是各目标最差值，
+    争议往往落在「到底是哪个目标上挂的」，那时要能单独拿出那个目标的原始输出。"""
     import config
 
     base = Path(config.VERIFY_EVIDENCE_DIR) / f"p{project_id}" / f"v{version}"
@@ -59,58 +66,252 @@ def archive_evidence(outcome: dict, project_id: int, version, stage: str = "exec
         path.write_text(outcome.get("raw_log") or "", encoding="utf-8")
         meta = base / f"{stage}.json"
         slim = {k: v for k, v in outcome.items() if k != "raw_log"}
+        per_target = slim.get("target_results")
+        if isinstance(per_target, dict) and per_target:
+            slim["target_results"] = {
+                tid: {k: v for k, v in (t or {}).items() if k not in _TARGET_LOG_KEYS}
+                for tid, t in per_target.items()}
         meta.write_text(json.dumps(slim, ensure_ascii=False, indent=2, default=str),
                         encoding="utf-8")
+        ran = [tid for tid, t in (outcome.get("target_results") or {}).items()
+               if (t or {}).get("ran")]
+        # 只有多目标才另存 <目标id>.log：单目标时 exec.log 就是那个目标的完整原文，
+        # 再写一份等于把同一批字节存两遍，还会让既有项目的证据目录凭空多出文件。
+        if len(ran) > 1:
+            for tid in ran:
+                try:
+                    (base / f"{tid}.log").write_text(
+                        (outcome["target_results"][tid].get("raw_log") or ""),
+                        encoding="utf-8")
+                except OSError:
+                    pass
     except OSError:
         return ""
     return str(path).replace("\\", "/")
 
 
 # ---------------- 编译探针（代码 / 测试实现阶段的硬校验） ----------------
+def _probe_one_target(runner, workdir: str, code_files: dict,
+                      test_files: dict | None, link: bool, tgt, timeout) -> dict:
+    """在一个目标机上做「能不能编（/能不能链）」的硬校验。"""
+    files = buildkit.workspace_files(code_files, test_files, tgt)
+    files.pop("build.sh", None)                 # 探针不运行、不采覆盖率
+    files["check.sh"] = buildkit.check_script(link=link, tgt=tgt)
+    # 探针目录每轮清空重来：上一轮的 .o 残留会让「其实编不过」的结论被掩盖
+    runner.run(f"rm -rf {_shq(workdir)}", timeout=30)
+    runner.sync(files, workdir)
+    res = runner.run("sh check.sh", cwd=workdir, timeout=timeout)
+    log = res.output
+    ok = res.ok and "WB_BUILD_RESULT ok" in (res.stdout or "")
+    if not ok and not log.strip():
+        log = f"退出码 {res.exit_code}，无输出"
+    return {"target": tgt.id, "ok": ok, "skipped": False, "exit_code": res.exit_code,
+            "log": _clip(log, 60_000), "reason": "" if ok else "远端编译未通过",
+            "workdir": workdir, "cmd": res.cmd}
+
+
 def compile_probe(runner, project_id: int, code_files: dict,
                   test_files: dict | None = None, stage: str = "code",
-                  timeout: int | None = None) -> dict:
+                  timeout: int | None = None, targets=None) -> dict:
     """远端编译校验。返回 {"ok", "reason", "log", "exit_code", "skipped"}。
 
     test_files 为 None 时只编 src（代码阶段）；给了就连测试一起编并链接
     （测试实现阶段：链接通过才说明测试真的能跑起来）。
     runner 为 None 表示未配置验证机，此时不做远端编译，明确标 skipped——
-    离线/mock 模式要能继续走，但绝不能把 skipped 当成 ok。"""
+    离线/mock 模式要能继续走，但绝不能把 skipped 当成 ok。
+
+    targets 给了多个目标机时逐个校验，返回里多带 targets / per_target；
+    某个目标的交叉工具链没装属于**环境问题**而不是代码问题：该目标记 skipped
+    并在 unavailable 里点名，不触发重生（重生也变不出编译器），
+    真正的拦截发生在执行验证节点——那里会因该目标未验证而转人工。"""
     link = test_files is not None
     if runner is None:
         return {"ok": True, "skipped": True, "exit_code": None, "log": "",
                 "reason": "未配置验证机，跳过远端编译校验（WARN）"}
 
-    files = buildkit.workspace_files(code_files, test_files)
-    files.pop("build.sh", None)                 # 探针不运行、不采覆盖率
-    files["check.sh"] = buildkit.check_script(link=link)
-
-    workdir = f"{runner.workdir(project_id, 'probe')}/{stage}"
-    # 探针目录每轮清空重来：上一轮的 .o 残留会让「其实编不过」的结论被掩盖
-    runner.run(f"rm -rf {_shq(workdir)}", timeout=30)
     try:
-        runner.sync(files, workdir)
-        res = runner.run("sh check.sh", cwd=workdir, timeout=timeout)
+        tgts = tgt_tab.resolve(targets)
+    except tgt_tab.TargetError as e:
+        return {"ok": False, "skipped": False, "exit_code": None, "log": "",
+                "reason": f"目标机配置错误：{e}", "targets": []}
+    multi = len(tgts) > 1
+    base_wd = f"{runner.workdir(project_id, 'probe')}/{stage}"
+    cross = [t for t in tgts if not t.host]
+    probed = tgt_tab.probe_targets(runner, cross) if cross else {}
+    unavailable = tgt_tab.unavailable_reason(probed, cross) if cross else ""
+
+    per_target: dict = {}
+    order: list = []
+    try:
+        for t in tgts:
+            wd = f"{base_wd}/{t.id}" if multi else base_wd
+            info = probed.get(t.id)
+            if info is not None and not info.get("ok"):
+                per_target[t.id] = {
+                    "target": t.id, "ok": True, "skipped": True, "exit_code": None,
+                    "log": "", "workdir": wd,
+                    "reason": "目标机工具链不可用（缺 "
+                              f"{str(info.get('tools') or '交叉编译器/qemu').strip()}），"
+                              "本阶段未校验"}
+            else:
+                per_target[t.id] = _probe_one_target(
+                    runner, wd, code_files, test_files, link, t, timeout)
+            order.append(t.id)
     except Exception as e:                       # 连不上、超时、tar 缺失
         return {"ok": False, "skipped": False, "exit_code": None, "log": "",
                 "reason": f"验证机不可用：{e}"}
 
-    log = res.output
-    ok = res.ok and "WB_BUILD_RESULT ok" in (res.stdout or "")
-    if not ok and not log.strip():
-        log = f"退出码 {res.exit_code}，无输出"
-    return {"ok": ok, "skipped": False, "exit_code": res.exit_code,
-            "log": _clip(log, 60_000), "reason": "" if ok else "远端编译未通过",
-            "workdir": workdir, "cmd": res.cmd}
+    checked = [tid for tid in order if not per_target[tid].get("skipped")]
+    if not multi:
+        one = per_target[order[0]]
+        out = {"ok": bool(one.get("ok")), "skipped": bool(one.get("skipped")),
+               "exit_code": one.get("exit_code"), "log": one.get("log") or "",
+               "reason": one.get("reason") or "", "workdir": one.get("workdir"),
+               "cmd": one.get("cmd")}
+        if unavailable:
+            out["unavailable"] = unavailable
+        return out
+
+    ok = all(bool(per_target[tid].get("ok")) for tid in checked) if checked else True
+    bad = [tid for tid in checked if not per_target[tid].get("ok")]
+    reason = "" if ok else "；".join(
+        f"{tid}：{per_target[tid].get('reason')}" for tid in bad)
+    if not checked and not reason:
+        # 一个目标都没真编过：这既不是「通过」也不是「编译失败」，
+        # 措辞必须说准，否则日志会把它写成代码问题去触发重生。
+        reason = f"所有目标机均未校验（{unavailable or '工具链不可用'}）"
+    return {
+        "ok": ok, "skipped": not checked,
+        "exit_code": next((per_target[tid].get("exit_code") for tid in bad), None),
+        "log": _clip("\n".join(
+            f"===== 目标机 {tid} =====\n{per_target[tid].get('log') or ''}"
+            for tid in order if not per_target[tid].get("skipped")), 60_000),
+        "reason": reason,
+        "targets": order, "per_target": per_target,
+        **({"unavailable": unavailable} if unavailable else {}),
+    }
 
 
 # ---------------- 完整验证运行 ----------------
+_VERDICT_RANK = {VERDICT_OK: 0, VERDICT_SKIPPED: 1, VERDICT_FAIL: 2}
+
+
+def _worst(values) -> str:
+    """逐维取最差：fail > skipped > ok。
+
+    多目标汇总只能用最差值，不能用多数表决：host 全过而 ppc32 挂一条，
+    说明代码里藏着字节序假设——这正是换目标机要抓的东西，投票恰好会把它投掉。"""
+    vals = [v for v in values if v]
+    return max(vals, key=lambda v: _VERDICT_RANK.get(v, 1)) if vals else VERDICT_SKIPPED
+
+
+def _verdict_of(build_ok: bool, tests: dict, coverage: dict) -> dict:
+    """三维判定：构建不过则后两维只能是 skipped（没跑起来的东西谈不上通过率）。"""
+    return {
+        "build": VERDICT_OK if build_ok else VERDICT_FAIL,
+        "tests": (VERDICT_OK if tests["all_pass"] else VERDICT_FAIL) if build_ok
+                 else VERDICT_SKIPPED,
+        "coverage": (VERDICT_OK if coverage["ok"] else VERDICT_FAIL) if build_ok
+                    else VERDICT_SKIPPED,
+    }
+
+
+def _target_reason(build_ok: bool, no_source: bool, tests: dict, coverage: dict,
+                   branch_min: float, line_min: float) -> str:
+    if not build_ok:
+        return "无源文件可编译" if no_source else "编译或链接失败"
+    if not tests["all_pass"]:
+        return f"{tests['failed']} 条用例失败" + (
+            f"，{tests['missing']} 条未执行" if tests["missing"] else "")
+    if not coverage["ok"]:
+        return _coverage_reason(coverage, branch_min, line_min)
+    return ""
+
+
+def _run_one_target(runner, workdir: str, code_files: dict, test_files: dict,
+                    tgt, case_ids, branch_min: float, line_min: float,
+                    timeout) -> dict:
+    """一个目标机上的一轮完整执行：同步 → 构建运行 → 采覆盖率 → 解析出该目标结论。
+
+    每个目标各有一份完整结论（构建/用例/覆盖率/原始输出/环境指纹），
+    汇总层只做「取最差」，不重新解释工具输出——判据只能有一个来源。"""
+    try:
+        manifest = runner.sync(buildkit.workspace_files(code_files, test_files, tgt),
+                               workdir)
+    except Exception as e:                       # 连不上、超时、tar 缺失
+        why = f"同步到验证机失败：{e}"
+        return {"target": tgt.id, "facts": tgt.facts(), "why": tgt.why,
+                "status": "error", "ran": False, "available": True, "ok": False,
+                "error": why, "reason": why, "workdir": workdir, "manifest": {},
+                "verdict": {k: VERDICT_SKIPPED for k in ("build", "tests", "coverage")}}
+
+    res = runner.run("sh build.sh", cwd=workdir, timeout=timeout)
+    sections = parsers.parse_sections(res.stdout or "")
+    build_log = sections.get("build", "")
+    diags = parsers.parse_diagnostics(build_log)
+    build_ok = ("WB_BUILD_RESULT ok" in build_log) and res.exit_code != buildkit.EXIT_BUILD_FAIL
+    no_source = res.exit_code == buildkit.EXIT_NO_SOURCE
+    tests = parsers.parse_test_output(sections.get("run", ""), expected_ids=case_ids)
+    coverage = parsers.summarize_coverage(
+        parsers.parse_gcov_multi(sections.get("coverage", "")),
+        branch_min=branch_min, line_min=line_min)
+    ok = build_ok and tests["all_pass"] and coverage["ok"]
+    return {
+        "target": tgt.id, "facts": tgt.facts(), "why": tgt.why,
+        "status": "ok" if ok else "fail", "ran": True, "available": True,
+        "ok": ok, "no_source": no_source,
+        "reason": _target_reason(build_ok, no_source, tests, coverage,
+                                 branch_min, line_min),
+        "verdict": _verdict_of(build_ok, tests, coverage),
+        "workdir": workdir, "manifest": manifest, "exit_code": res.exit_code,
+        "transport": res.transport,
+        "commands": [{"cmd": res.cmd, "cwd": res.cwd, "exit_code": res.exit_code,
+                      "duration_s": round(res.duration_s, 3)}],
+        "env": parsers.parse_kv(sections.get("env", "")),
+        "build": {"ok": build_ok, "log": _clip(build_log, 60_000),
+                  "diagnostics": diags,
+                  "warnings": [d for d in diags if d["level"] == "warning"],
+                  "errors": [d for d in diags if d["level"] == "error"]},
+        "tests": tests,
+        "coverage": coverage,
+        "raw_log": _clip(res.output),
+        "run_section": _clip(sections.get("run", ""), 60_000),
+        "coverage_section": _clip(sections.get("coverage", ""), 60_000),
+    }
+
+
+def _merge_build(ran: dict) -> dict:
+    """多目标构建结论合并：诊断逐条标注来自哪个目标，日志按目标分段拼接。"""
+    diags, logs = [], []
+    for tid, t in ran.items():
+        b = t.get("build") or {}
+        for d in b.get("diagnostics") or []:
+            diags.append({**d, "target": tid})
+        if (b.get("log") or "").strip():
+            logs.append(f"===== 目标机 {tid} =====\n{b['log']}")
+    return {"ok": bool(ran) and all((t.get("build") or {}).get("ok")
+                                    for t in ran.values()),
+            "log": _clip("\n".join(logs), 60_000), "diagnostics": diags,
+            "warnings": [d for d in diags if d["level"] == "warning"],
+            "errors": [d for d in diags if d["level"] == "error"]}
+
+
+def _join_per_target(ran: dict, order: list, key: str) -> str:
+    return _clip("\n".join(f"===== 目标机 {tid} =====\n{ran[tid].get(key) or ''}"
+                           for tid in order if tid in ran))
+
+
 def run_verification(runner, project_id: int, version,
                      code_files: dict, test_files: dict,
                      case_ids=None, branch_min: float = 80.0,
                      line_min: float = 0.0, timeout: int | None = None,
-                     decision_cb=None) -> dict:
-    """跑一轮完整验证：同步 → 构建运行 → 覆盖率 → 解析 → 出结论。"""
+                     decision_cb=None, targets=None) -> dict:
+    """跑一轮完整验证：同步 → 构建运行 → 覆盖率 → 解析 → 出结论。
+
+    targets 为空时只在验证机本机跑，证据布局与结论形状与单目标时代完全一致；
+    配了多个目标机则逐个交叉编译 + qemu 执行，结论按「取最差」汇总。
+    工具链缺失的目标记 unavailable，整轮转人工（blocked）——
+    「这个目标没测」绝不能被写成「这个目标通过」。"""
     t0 = time.time()
     base = {
         "project_id": project_id, "version": str(version),
@@ -118,99 +319,165 @@ def run_verification(runner, project_id: int, version,
         "manifest": {}, "env": {}, "thresholds": {"branch_min": branch_min,
                                                    "line_min": line_min},
     }
+    skipped_verdict = {"build": VERDICT_SKIPPED, "tests": VERDICT_SKIPPED,
+                       "coverage": VERDICT_SKIPPED}
+
+    def _blocked(reason: str, **extra) -> dict:
+        return {**base, **extra, "ok": False, "skipped": True,
+                "decision": DECISION_BLOCKED, "reason": reason,
+                "verdict": dict(skipped_verdict)}
+
+    try:
+        tgts = tgt_tab.resolve(targets)
+    except tgt_tab.TargetError as e:
+        return _blocked(f"目标机配置错误：{e}")
+    order = [t.id for t in tgts]
+    multi = len(tgts) > 1
 
     if runner is None:
-        return {**base, "ok": False, "skipped": True, "decision": DECISION_BLOCKED,
-                "reason": "未配置验证机（VERIFY_HOST 为空），无法执行编译与测试",
-                "verdict": {"build": VERDICT_SKIPPED, "tests": VERDICT_SKIPPED,
-                            "coverage": VERDICT_SKIPPED}}
+        return _blocked("未配置验证机（VERIFY_HOST 为空），无法执行编译与测试",
+                        targets=order)
 
     try:
         probe = runner.probe()
     except Exception as e:
-        return {**base, "ok": False, "skipped": True, "decision": DECISION_BLOCKED,
-                "reason": f"验证机探测失败：{e}",
-                "verdict": {"build": VERDICT_SKIPPED, "tests": VERDICT_SKIPPED,
-                            "coverage": VERDICT_SKIPPED}}
+        return _blocked(f"验证机探测失败：{e}", targets=order)
     if not probe.get("ok"):
-        return {**base, "ok": False, "skipped": True, "decision": DECISION_BLOCKED,
-                "reason": f"验证机工具链不可用：{probe.get('error') or '未知原因'}",
-                "env": probe,
-                "verdict": {"build": VERDICT_SKIPPED, "tests": VERDICT_SKIPPED,
-                            "coverage": VERDICT_SKIPPED}}
+        return _blocked(f"验证机工具链不可用：{probe.get('error') or '未知原因'}",
+                        env=probe, targets=order)
 
-    files = buildkit.workspace_files(code_files, test_files)
-    workdir = runner.workdir(project_id, version)
-    try:
-        manifest = runner.sync(files, workdir)
-    except Exception as e:
-        return {**base, "ok": False, "skipped": True, "decision": DECISION_BLOCKED,
-                "reason": f"同步到验证机失败：{e}", "env": probe, "workdir": workdir,
-                "verdict": {"build": VERDICT_SKIPPED, "tests": VERDICT_SKIPPED,
-                            "coverage": VERDICT_SKIPPED}}
+    # host 的工具链已由 runner.probe 覆盖，只有交叉目标才额外探测：
+    # 单目标路径不产生任何新的远端调用，既有证据与耗时一字不变。
+    cross = [t for t in tgts if not t.host]
+    probed = tgt_tab.probe_targets(runner, cross) if cross else {}
 
-    res = runner.run("sh build.sh", cwd=workdir, timeout=timeout)
-    raw = res.output
-    sections = parsers.parse_sections(res.stdout or "")
-    env = {**{k: probe.get(k) for k in ("uname", "cores", "gcc", "gcov", "make", "tar")
-              if probe.get(k)}, **parsers.parse_kv(sections.get("env", ""))}
+    base_wd = runner.workdir(project_id, version)
+    per_target: dict = {}
+    for t in tgts:
+        wd = f"{base_wd}/{t.id}" if multi else base_wd
+        info = probed.get(t.id)
+        if info is not None and not info.get("ok"):
+            per_target[t.id] = {
+                "target": t.id, "facts": t.facts(), "why": t.why,
+                "status": "unavailable", "ran": False, "available": False,
+                "ok": False, "probe": info, "workdir": wd, "manifest": {},
+                "reason": "目标机工具链不可用（缺 "
+                          f"{str(info.get('tools') or '交叉编译器/qemu').strip()}）",
+                "verdict": dict(skipped_verdict)}
+            continue
+        per_target[t.id] = _run_one_target(runner, wd, code_files, test_files, t,
+                                           case_ids, branch_min, line_min, timeout)
 
-    build_log = sections.get("build", "")
-    diags = parsers.parse_diagnostics(build_log)
-    build_ok = ("WB_BUILD_RESULT ok" in build_log) and res.exit_code != buildkit.EXIT_BUILD_FAIL
-    no_source = res.exit_code == buildkit.EXIT_NO_SOURCE
+    ran = {tid: per_target[tid] for tid in order if per_target[tid].get("ran")}
+    dead = {tid: per_target[tid] for tid in order if not per_target[tid].get("ran")}
+    if not ran:
+        only = per_target[order[0]]
+        return _blocked(only.get("error") or only.get("reason") or "所有目标机均无法执行",
+                        env=probe, workdir=base_wd, targets=order,
+                        target_results=per_target,
+                        **({"target_probe": probed} if probed else {}))
 
-    tests = parsers.parse_test_output(sections.get("run", ""), expected_ids=case_ids)
-    cov_parsed = parsers.parse_gcov_multi(sections.get("coverage", ""))
-    coverage = parsers.summarize_coverage(cov_parsed, branch_min=branch_min,
-                                          line_min=line_min)
+    # 顶层输入指纹一律按 host 构建脚本计算：它代表「源码基线」，与目标无关，
+    # 软件工程包据此逐文件对齐；各目标真实同步的构建脚本指纹在 target_results 里。
+    manifest = runner.manifest(buildkit.workspace_files(code_files, test_files))
 
-    verdict = {
-        "build": VERDICT_OK if build_ok else VERDICT_FAIL,
-        "tests": (VERDICT_OK if tests["all_pass"] else VERDICT_FAIL) if build_ok
-                 else VERDICT_SKIPPED,
-        "coverage": (VERDICT_OK if coverage["ok"] else VERDICT_FAIL) if build_ok
-                    else VERDICT_SKIPPED,
-    }
-    ok = build_ok and tests["all_pass"] and coverage["ok"]
+    if not multi:
+        one = ran[order[0]]
+        build, tests, coverage = one["build"], one["tests"], one["coverage"]
+        verdict = one["verdict"]
+        env = {**{k: probe.get(k) for k in ("uname", "cores", "gcc", "gcov", "make", "tar")
+                  if probe.get(k)}, **one.get("env", {})}
+        commands = list(one.get("commands") or [])
+        raw = one.get("raw_log") or ""
+        run_section = one.get("run_section") or ""
+        coverage_section = one.get("coverage_section") or ""
+        exit_code = one.get("exit_code")
+        transport = one.get("transport")
+        workdir = one.get("workdir")
+        ok = bool(one.get("ok"))
+        reason = one.get("reason") or ""
+    else:
+        build_tids = [tid for tid in order
+                      if tid in ran and (ran[tid].get("build") or {}).get("ok")]
+        build = _merge_build(ran)
+        tests = (parsers.merge_tests({tid: ran[tid]["tests"] for tid in build_tids})
+                 if build_tids
+                 else parsers.parse_test_output("", expected_ids=case_ids))
+        cov_src = {tid: ran[tid]["coverage"] for tid in build_tids
+                   if (ran[tid]["coverage"].get("functions")
+                       or (ran[tid]["coverage"].get("totals") or {}).get("lines_total"))}
+        coverage = (parsers.merge_coverage(cov_src, branch_min=branch_min,
+                                           line_min=line_min) if cov_src
+                    else parsers.summarize_coverage({}, branch_min=branch_min,
+                                                    line_min=line_min))
+        verdict = {k: _worst([ran[tid]["verdict"].get(k) for tid in ran])
+                   for k in ("build", "tests", "coverage")}
+        env = {**{k: probe.get(k) for k in ("uname", "cores", "make", "tar")
+                  if probe.get(k)},
+               "gcc": " | ".join(f"{tid}: {(ran[tid].get('env') or {}).get('gcc') or '-'}"
+                                 for tid in order if tid in ran),
+               "gcov": " | ".join(f"{tid}: {(ran[tid].get('env') or {}).get('gcov') or '-'}"
+                                  for tid in order if tid in ran),
+               "targets": ",".join(order),
+               "target_env": {tid: ran[tid].get("env") or {}
+                              for tid in order if tid in ran}}
+        if probed:
+            env["target_probe"] = probed
+        commands = [dict(c, target=tid) for tid in order if tid in ran
+                    for c in (ran[tid].get("commands") or [])]
+        raw = _join_per_target(ran, order, "raw_log")
+        run_section = _join_per_target(ran, order, "run_section")
+        coverage_section = _join_per_target(ran, order, "coverage_section")
+        exit_code = next((ran[tid].get("exit_code") for tid in order
+                          if tid in ran and ran[tid].get("exit_code") not in (0, None)), 0)
+        transport = next((ran[tid].get("transport") for tid in order if tid in ran), "")
+        workdir = base_wd
+        bad = [tid for tid in order if not per_target[tid].get("ok")]
+        ok = not bad
+        reason = (f"{len(bad)}/{len(order)} 个目标机未通过：" + "；".join(
+            f"{tid}：{per_target[tid].get('reason') or per_target[tid].get('error') or '未知原因'}"
+            for tid in bad)) if bad else ""
 
-    decision = DECISION_NEXT if ok else DECISION_FIX_CODE
-    reason = ""
-    if not build_ok:
-        reason = "无源文件可编译" if no_source else "编译或链接失败"
-    elif not tests["all_pass"]:
-        reason = f"{tests['failed']} 条用例失败" + (
-            f"，{tests['missing']} 条未执行" if tests["missing"] else "")
-    elif not coverage["ok"]:
-        reason = _coverage_reason(coverage, branch_min, line_min)
-    if not ok and decision_cb is not None:
-        try:
-            decision, reason = decision_cb(outcome_reason=reason, tests=tests,
-                                           coverage=coverage, build_ok=build_ok,
-                                           diags=diags) or (decision, reason)
-        except Exception:
-            pass
+    if dead:
+        decision = DECISION_BLOCKED
+    else:
+        decision = DECISION_NEXT if ok else DECISION_FIX_CODE
+        if not ok and decision_cb is not None:
+            try:
+                decision, reason = decision_cb(outcome_reason=reason, tests=tests,
+                                               coverage=coverage,
+                                               build_ok=build["ok"],
+                                               diags=build["diagnostics"]) or (decision, reason)
+            except Exception:
+                pass
 
     outcome = {
         **base,
         "ok": ok, "skipped": False, "decision": decision, "reason": reason,
         "verdict": verdict, "env": env, "manifest": manifest,
-        "workdir": workdir, "exit_code": res.exit_code,
+        "workdir": workdir, "exit_code": exit_code,
         "duration_s": round(time.time() - t0, 3),
-        "transport": res.transport,
-        "commands": [{"cmd": res.cmd, "cwd": res.cwd, "exit_code": res.exit_code,
-                      "duration_s": round(res.duration_s, 3)}],
+        "transport": transport,
+        "commands": commands,
         "synced_files": sorted(manifest.keys()),
-        "build": {"ok": build_ok, "log": _clip(build_log, 60_000),
-                  "diagnostics": diags,
-                  "warnings": [d for d in diags if d["level"] == "warning"],
-                  "errors": [d for d in diags if d["level"] == "error"]},
+        "build": build,
         "tests": tests,
         "coverage": coverage,
-        "raw_log": _clip(raw),
-        "run_section": _clip(sections.get("run", ""), 60_000),
-        "coverage_section": _clip(sections.get("coverage", ""), 60_000),
+        "raw_log": raw,
+        "run_section": run_section,
+        "coverage_section": coverage_section,
+        "targets": order,
+        "target_results": per_target,
     }
+    if probed:
+        outcome["target_probe"] = probed
+    if not multi:
+        real = ran[order[0]].get("manifest") or {}
+        if real and real != manifest:
+            outcome["manifest_note"] = (
+                "顶层输入指纹按 host 构建脚本计算（用于与源码基线对齐）；"
+                f"实际同步到 {order[0]} 的构建脚本指纹见 target_results."
+                f"{order[0]}.manifest")
     return outcome
 
 
@@ -253,7 +520,10 @@ def failure_brief(outcome: dict, limit: int = 20) -> str:
     """把一轮失败的验证结论压成归因智能体能读的简报。
 
     归因要判「代码缺陷还是测试缺陷」，需要的正是三样：编译器怎么说、
-    哪条用例失败以及失败时打印了什么、哪些函数根本没被执行到。"""
+    哪条用例失败以及失败时打印了什么、哪些函数根本没被执行到。
+
+    多目标机时先给逐目标一行结论，再只展开失败目标的明细——归因智能体第一件
+    要判断的事就是「所有目标都挂还是只有某个架构挂」，这个信息必须放在最前面。"""
     lines = []
     verdict = outcome.get("verdict") or {}
     lines.append(f"判定：构建 {verdict.get('build')} · 用例 {verdict.get('tests')} · "
@@ -261,14 +531,36 @@ def failure_brief(outcome: dict, limit: int = 20) -> str:
     if outcome.get("reason"):
         lines.append(f"结论：{outcome['reason']}")
 
-    build = outcome.get("build") or {}
+    per_target = outcome.get("target_results") or {}
+    if len(per_target) > 1:
+        lines.append("目标机逐项：")
+        for tid, t in per_target.items():
+            v = t.get("verdict") or {}
+            note = "" if t.get("ok") else f"（{t.get('reason') or t.get('error')}）"
+            lines.append(f"- {tid}：构建 {v.get('build')} · 用例 {v.get('tests')} · "
+                         f"覆盖率 {v.get('coverage')}{note}")
+        for tid, t in per_target.items():
+            if t.get("ok") or not t.get("ran"):
+                continue
+            lines += ["", f"--- 目标机 {tid} 明细 ---"]
+            lines += _brief_one(t.get("build") or {}, t.get("tests") or {},
+                                t.get("coverage") or {}, limit)
+        return "\n".join(lines)
+
+    lines += _brief_one(outcome.get("build") or {}, outcome.get("tests") or {},
+                        outcome.get("coverage") or {}, limit)
+    return "\n".join(lines)
+
+
+def _brief_one(build: dict, tests: dict, cov: dict, limit: int = 20) -> list:
+    """一份（可能是某个目标机的）结论 → 明细行。单目标与多目标共用同一套措辞。"""
+    lines = []
     for d in (build.get("diagnostics") or [])[:limit]:
         lines.append(f"[{d['level']}] {d['file']}:{d['line']}: {d['msg']}")
     if not build.get("ok"):
         tail = (build.get("log") or "").strip().splitlines()[-15:]
         lines += [f"构建日志尾部：{ln}" for ln in tail]
 
-    tests = outcome.get("tests") or {}
     for r in (tests.get("results") or []):
         if r["status"] != parsers.ST_PASS:
             lines.append(f"[{r['status'].upper()}] {r['id']} {r.get('detail','')}")
@@ -277,7 +569,6 @@ def failure_brief(outcome: dict, limit: int = 20) -> str:
     if tests.get("consistent") is False:
         lines.append("测试桩自报的用例数与实际输出不一致，测试代码本身可能有问题")
 
-    cov = outcome.get("coverage") or {}
     if cov.get("untested_functions"):
         lines.append("未被执行到的函数：" + "、".join(cov["untested_functions"]))
     if cov.get("below_branch"):
@@ -288,7 +579,7 @@ def failure_brief(outcome: dict, limit: int = 20) -> str:
                      f"（{totals.get('lines_hit')}/{totals.get('lines_total')}）　"
                      f"分支 {_pct(totals.get('branch_pct'))}"
                      f"（{totals.get('branch_taken')}/{totals.get('branch_total')}）")
-    return "\n".join(lines)
+    return lines
 
 
 def _diag_side(path) -> str:
@@ -312,11 +603,65 @@ def auto_decision(outcome: dict) -> tuple[str, str] | None:
       测试桩不自洽  自报条数与解析条数对不上，测试代码上报逻辑有误。
     返回 None 表示需要归因智能体介入（典型是用例判据与实现行为对不上，
     以及进程崩溃——两者都可能是任意一侧的问题）。
+
+    多目标机时多一条确定性判据，而且它排在最前面：本机全过、只有交叉目标挂，
+    那就是可移植性缺陷，责任必然在被测代码——这类问题交给模型读代码反而容易
+    被判成「测试期望值写错了」。
     """
     if outcome.get("skipped"):
         return DECISION_BLOCKED, outcome.get("reason") or "验证机不可用"
 
-    build = outcome.get("build") or {}
+    per_target = outcome.get("target_results") or {}
+    if len(per_target) > 1:
+        return _decide_multi(per_target)
+    return _decide_single(outcome.get("build") or {}, outcome.get("tests") or {},
+                          outcome.get("coverage") or {})
+
+
+def _is_host_target(target_id: str) -> bool:
+    t = tgt_tab.by_id(target_id)
+    return bool(t and t.host)
+
+
+def _decide_multi(per_target: dict) -> tuple[str, str] | None:
+    """多目标归因：先看有没有目标根本没跑，再看是不是「只有交叉目标挂」。"""
+    dead = {tid: t for tid, t in per_target.items() if not t.get("ran")}
+    if dead:
+        return DECISION_BLOCKED, ("目标机未全部执行，结论不完整：" + "；".join(
+            f"{tid}：{t.get('reason') or t.get('error') or '未执行'}"
+            for tid, t in dead.items()))
+
+    bad = {tid: t for tid, t in per_target.items() if not t.get("ok")}
+    if not bad:
+        return None
+
+    host_ids = [tid for tid in per_target if _is_host_target(tid)]
+    host_green = all(per_target[tid].get("ok") for tid in host_ids)
+    cross_only = all(not _is_host_target(tid) for tid in bad)
+    case_level = all((t.get("build") or {}).get("ok")
+                     and ((t.get("tests") or {}).get("failed")
+                          or (t.get("tests") or {}).get("missing"))
+                     for t in bad.values())
+    if cross_only and case_level and (host_green or not host_ids):
+        detail = "；".join(f"{tid}：{bad[tid].get('reason')}" for tid in bad)
+        scope = ("验证机本机全部通过，" if host_ids else "其余目标机通过，")
+        return DECISION_FIX_CODE, (
+            f"同一份源码{scope}只在交叉目标上失败（{detail}）。"
+            "判为可移植性缺陷：字长 / 字节序 / 对齐 / 整型宽度假设，"
+            "责任在被测代码，不得靠修改测试判据绕过。")
+
+    decided = {tid: _decide_single(t.get("build") or {}, t.get("tests") or {},
+                                   t.get("coverage") or {})
+               for tid, t in bad.items()}
+    if all(decided.values()) and len({d[0] for d in decided.values()}) == 1:
+        kind = next(iter(decided.values()))[0]
+        detail = "；".join(f"{tid}：{decided[tid][1]}" for tid in bad)
+        return kind, f"{len(bad)} 个目标机归因一致（{kind}）——{detail}"
+    return None
+
+
+def _decide_single(build: dict, tests: dict, cov: dict) -> tuple[str, str] | None:
+    """单个目标上的确定性归因判据（多目标时对每个失败目标各跑一次）。"""
     if not build.get("ok"):
         log_text = build.get("log") or ""
         diags = build.get("errors") or build.get("diagnostics") or []
@@ -335,14 +680,12 @@ def auto_decision(outcome: dict) -> tuple[str, str] | None:
             return DECISION_FIX_TEST, f"链接失败（符号未定义或重复定义）：{_tail(log_text)}"
         return DECISION_FIX_CODE, f"构建失败：{_tail(log_text)}"
 
-    tests = outcome.get("tests") or {}
     if tests.get("consistent") is False:
         return DECISION_FIX_TEST, (
             f"测试桩自报 total={tests.get('reported_total')} "
             f"failed={tests.get('reported_failed')}，与实际解析出的 "
             f"{tests.get('total')} 条不一致，测试代码的结果上报有误")
 
-    cov = outcome.get("coverage") or {}
     if tests.get("all_pass") and not cov.get("ok"):
         parts = []
         if cov.get("untested_functions"):
@@ -381,15 +724,39 @@ def markdown_report(outcome: dict, title: str = "代码验证执行报告") -> s
     lines.append("")
 
     env = outcome.get("env") or {}
+    per_target = outcome.get("target_results") or {}
+    multi = len(per_target) > 1
     lines += ["## 执行环境", "",
               "| 项 | 值 |", "|---|---|",
               f"| 传输方式 | {outcome.get('transport', '-')} |",
-              f"| 目标机 | {env.get('uname', '-')} |",
+              f"| 验证机 | {env.get('uname', '-')} |",
               f"| 编译器 | {env.get('gcc', '-')} |",
               f"| 覆盖率工具 | {env.get('gcov', '-')} |",
               f"| 远端工作目录 | {outcome.get('workdir', '-')} |",
               f"| 编译选项 | {buildkit.CFLAGS} |",
               f"| 耗时 | {outcome.get('duration_s', 0)} s |", ""]
+
+    if multi:
+        lines += ["## 目标机矩阵", "",
+                  "> 同一份源码在每个目标机上分别交叉编译并执行，汇总结论取各目标最差值："
+                  "任一目标不通过即整体不通过。工具链缺失的目标记为「未执行」，"
+                  "整轮转人工裁决，不会被静默放行。", "",
+                  "| 目标 | 字长/字节序 | 编译器 | 执行方式 | 构建 | 用例 | 覆盖率 | 说明 |",
+                  "|---|---|---|---|---|---|---|---|"]
+        for tid, t in per_target.items():
+            f = t.get("facts") or {}
+            v = t.get("verdict") or {}
+            run = f"`{f.get('qemu')}`" if f.get("qemu") else "本机直接执行"
+            endian = "大端" if f.get("endian") == "big" else "小端"
+            note = (t.get("reason") or t.get("error")
+                    or ("通过" if t.get("ok") else "未通过"))
+            lines.append(f"| {tid} · {f.get('label') or '-'} "
+                         f"| {f.get('bits', '-')} 位 / {endian} "
+                         f"| `{f.get('cc') or '-'}` | {run} "
+                         f"| {mark.get(v.get('build'), '-')} "
+                         f"| {mark.get(v.get('tests'), '-')} "
+                         f"| {mark.get(v.get('coverage'), '-')} | {note} |")
+        lines.append("")
 
     tests = outcome.get("tests") or {}
     results = tests.get("results") or []
@@ -397,10 +764,18 @@ def markdown_report(outcome: dict, title: str = "代码验证执行报告") -> s
               f"> 共 {tests.get('total', 0)} 条：通过 {tests.get('passed', 0)} · "
               f"失败 {tests.get('failed', 0)} · 未执行 {tests.get('missing', 0)}", ""]
     if results:
-        lines += ["| 用例 | 结果 | 说明 |", "|---|---|---|"]
-        for r in results:
-            detail = str(r.get("detail") or "").replace("|", "/").replace("\n", " ")
-            lines.append(f"| {r['id']} | {r.get('status_text', r['status'])} | {detail} |")
+        if multi:
+            lines += ["| 用例 | 结果 | 各目标机 | 说明 |", "|---|---|---|---|"]
+            for r in results:
+                detail = str(r.get("detail") or "").replace("|", "/").replace("\n", " ")
+                per = "、".join(f"{k} {v}" for k, v in (r.get("per_target") or {}).items())
+                lines.append(f"| {r['id']} | {r.get('status_text', r['status'])} "
+                             f"| {per} | {detail} |")
+        else:
+            lines += ["| 用例 | 结果 | 说明 |", "|---|---|---|"]
+            for r in results:
+                detail = str(r.get("detail") or "").replace("|", "/").replace("\n", " ")
+                lines.append(f"| {r['id']} | {r.get('status_text', r['status'])} | {detail} |")
         lines.append("")
     if tests.get("consistent") is False:
         lines += [f"> ⚠️ 测试桩自报 total={tests.get('reported_total')} "

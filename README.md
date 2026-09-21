@@ -1,6 +1,6 @@
 # 多智能体软件开发流水线 · 航天嵌入式 AI 自动化代码验证系统
 
-基于 **Flask + LangGraph + SQLite** 的多智能体软件研制流水线。上传 PRD / Word / PDF 需求文档后，由多个智能体按 V 模型依次产出结构化原始数据、需求规格说明书、概要设计、详细设计、测试用例设计、受限子集 C 代码与可执行测试；编译、用例执行、覆盖率采集在远端 Linux 验证机上跑，结论作为**确定性判据**回灌需求追溯矩阵，最终装配成可归档送审的交付件（软件测评报告 / 追溯矩阵 / 问题报告单 / 偏差单）。文档阶段均有人工评审门控，支持驳回带意见修订。
+基于 **Flask + LangGraph + SQLite** 的多智能体软件研制流水线。上传 PRD / Word / PDF 需求文档后，由多个智能体按 V 模型依次产出结构化原始数据、需求规格说明书、概要设计、详细设计、测试用例设计、受限子集 C 代码与可执行测试；编译、用例执行、覆盖率采集在远端 Linux 验证机上跑（可配**多目标机**：同一份源码在 arm32 / arm64 / ppc32 上交叉编译并用 qemu-user 执行），结论作为**确定性判据**回灌需求追溯矩阵，最终装配成可归档送审的**软件工程包**（各阶段文档 + 源码基线 + 追溯件 + 逐轮验证证据 + 包清单）。文档阶段均有人工评审门控，支持驳回带意见修订。
 
 智能体的输出**边生成边推给浏览器**（SSE 逐字增量，含推理模型的思考过程），不必等整份文档校验落库；每条需求带稳定编号，产出后可在**需求追溯矩阵**里横向看到「素材来源 → 需求 → 概要设计 → 详细设计 → 测试用例 → 代码单元 → 静态检查 → 执行结果 → 分支覆盖率」是否贯通、哪里有缺口。
 
@@ -24,7 +24,7 @@
 - **阶段6 代码实现智能体**：按详细设计的函数签名产出受限子集 C 代码（`include/` + `src/`），提示词里的编码约束与静态检查规则表同源。硬校验 = 验证机上的编译退出码。
 - **阶段7 静态检查（工具节点）**：无 LLM。pycparser 走规则表 + 远端 gcc 兜底，另做「设计覆盖检查」——详细设计的每个函数都必须在代码里存在且签名一致。
 - **阶段8 测试实现智能体**：把文字用例翻译成可执行 C 测试（`tests/*.c`，含 `main`）。只有这一阶段允许读代码 API。硬校验 = 测试程序编译链接退出码。
-- **阶段9 执行验证（工具节点）**：无 LLM。同步到验证机 → `build.sh`（`gcc -std=c99 -Wall -Wextra` + `-fprofile-arcs -ftest-coverage`）→ 解析用例结果与 `gcov -b -c` 文本 → 出「构建 / 用例 / 覆盖率」三维判定，并把原始日志、输入 sha256、工具链版本归档为证据。
+- **阶段9 执行验证（工具节点）**：无 LLM。同步到验证机 → `build.sh`（`gcc -std=c99 -Wall -Wextra` + `-fprofile-arcs -ftest-coverage`）→ 解析用例结果与 `gcov -b -c` 文本 → 出「构建 / 用例 / 覆盖率」三维判定，并把原始日志、输入 sha256、工具链版本归档为证据。配了多目标机时逐个交叉编译 + qemu 执行，汇总结论取各目标最差值（见「多目标机执行」）。
 - **阶段10 测评报告（工具节点）**：无 LLM。从库里已落库的产物装配结论，导出 docx / xlsx；失败过的那几轮登记为问题报告单，仍存在的必查项违规登记为偏差单。
 - **人工评审门控**：6 个文档阶段完成后流水线 `interrupt()` 暂停（检查点落 SQLite，跨进程重启不丢），Web 页面渲染 Markdown+Mermaid 评审，通过才进入下一阶段；驳回附意见，智能体带意见重跑并输出修订说明。3 个工具节点不设文风评审门，但**超限失败与静态偏差会停在专门的人工裁决门**上。
 
@@ -54,14 +54,40 @@ AI 生成的代码不能靠「看着像对的」验收。这一段的目标是�
 
 ### 验证执行环境
 
-编译 / 运行 / 覆盖率全部在远端 Linux 验证机上跑（Windows 侧只做编排、AI 生成与证据归档），因为需要可信的 gcc + gcov，且后续要换成 QEMU 目标机模拟。`verification/` 分四层，换执行环境只动 `runner`：
+编译 / 运行 / 覆盖率全部在远端 Linux 验证机上跑（Windows 侧只做编排、AI 生成与证据归档），因为需要可信的 gcc + gcov，也因为换目标架构时只该换执行环境、不该换判据。`verification/` 分五层，换执行环境只动 `runner`，换目标架构只动 `targets`：
 
 - `runner.py`：只做两件极窄的事——`sync(local, remote)` 送文件、`run(cmd, cwd)` 跑命令，原样带回退出码与 stdout/stderr，不做任何「看起来成功」的美化。`SshRunner` 直接 subprocess 调系统 OpenSSH（文件同步走 tar 管道），零新增 Python 依赖；`LocalRunner` 供本机自测。
 - `buildkit.py`：生成固定的 `build.sh` 与测试桩模板。「怎么编译、怎么跑、怎么采覆盖率」不散落在 AI 生成的代码里，于是同一份输入必然走同一条命令序列，证据可比对。
+- `targets.py`：目标机矩阵（架构事实 + 交叉编译器 + qemu 前缀 + 工具链探测脚本）。构建脚本参数与探测命令都从这张表导出，详见下一节。
 - `parsers.py`：把工具链原始输出解析成可判定结论——`build.sh` 分段标记、用例结果行（`TC-xxx PASS/FAIL 原因`）、`gcov -b -c -f` 传统文本（兼容 gcov 7.5，不依赖 `--json-format`）。解析不出来的显式标 `missing`，绝不静默当成通过。
 - `executor.py`：编排一次执行，固定带回四样东西——三维判定、输入指纹（同步前在本机算好的 sha256）、环境指纹（uname / gcc / gcov 版本）、原始输出全文。缺任何一样，结论都不能当交付证据用。
 
 验证机一次性配置：`scripts\setup_verify_vm.ps1` 生成密钥、用密码装公钥（**密码只在这一步用，不进仓库也不进 .env**）、把主机密钥钉进 known_hosts，此后全程免密。工作区为 `~/wb_verify/p<项目>/v<版本>/`，证据落在 `data/verify/p<项目>/v<版本>t<轮次>/`，每轮各自成目录不覆盖历史。未配置验证机时流水线退化为「只静态检查、不实际执行」，不会伪造执行结论。
+
+### 多目标机执行（qemu-user）
+
+宿主机 x86-64 上跑绿，只证明「在这台机器的 gcc 与 ABI 下行为正确」。星载软件的真实风险恰恰落在宿主机测不出来的地方：`long` 是 4 还是 8 字节、大端还是小端、非对齐访问、32 位截断。这些靠人评审看不出来，只能换目标机跑。qemu-user 把「换目标机」压成一条命令：交叉编译出静态二进制，用 `qemu-<arch>-static` 直接执行，gcov 插桩数据照常落盘。
+
+`verification/targets.py` 是目标表（与 `core/c_rules.py` 同一套路：判据先落成表，再由表导出构建脚本参数、探测命令与报告说明，不允许出现「表里说要测大端、脚本里却只编了 x86」）：
+
+| 目标 | 字长 / 字节序 | 编译器 | 执行方式 | 这个目标能抓出什么 |
+|---|---|---|---|---|
+| `host` | 64 位 / 小端 | `gcc` | 本机直接执行 | 基线与对照组：只有 host 通过而交叉目标失败，才能把问题定成可移植性缺陷 |
+| `arm32` | 32 位 / 小端 | `arm-linux-gnueabihf-gcc` | `qemu-arm-static` | 32 位 ABI 下被 64 位宿主机掩盖的整型截断、`sizeof` 误用、指针与整型互转；ARM 也是星载/弹载最常见的主力架构 |
+| `arm64` | 64 位 / 小端 | `aarch64-linux-gnu-gcc` | `qemu-aarch64-static` | 与 arm32 配成一对，专门暴露结构体对齐、位域布局与 `long` 宽度依赖 |
+| `ppc32` | 32 位 / **大端** | `powerpc-linux-gnu-gcc` | `qemu-ppc-static` | 把「按整型读缓冲、隐含小端假设」的写法直接判死；PowerPC 也是航天传统架构（如 RAD750） |
+
+启用方式：验证机上跑一次 `bash scripts/setup_verify_targets.sh`（幂等；装 `qemu-user-static` 与三套交叉工具链，装完对每个目标做一次「交叉编译 + qemu 执行 + 目标 gcov 采覆盖率」冒烟，并核对字长/字节序与目标表一致——包装上了不等于链子能跑通），然后 `.env` 里设 `VERIFY_TARGETS=host,arm32,ppc32`。不配则默认只有 `host`，单目标时代的证据布局与耗时一字不变。
+
+多目标的五条硬规矩，每条都对应测试或验收步骤：
+
+- **汇总结论取最差值，不做多数表决**（`fail > skipped > ok`）：host 全过而 ppc32 挂一条，整体就是不通过。
+- **交叉目标一律 `-static`**：动态执行要 qemu 去找目标架构的动态链接器与库搜索路径，静态链接把这类环境依赖一次消掉，证据也就与验证机的库版本无关。
+- **工具链缺失 = 未验证（`blocked`），不是通过**：配了 arm32 而验证机没装交叉编译器，该目标记 `unavailable`、整轮转人工裁决。重生也变不出编译器，所以这种情况不触发自动整改。
+- **逐目标各自留证**：独立工作区（`…/v<版本>t<轮次>/<目标id>/`）、独立原始输出（`<目标id>.log`，只在真的跑了多个目标时才另存）、独立环境指纹（编译器与 gcov 版本、字长、字节序）。报告出「3.1.1 目标机矩阵」与选型理由，逐目标列结论；每条用例也带逐目标结果，一眼看出「到底在哪个目标上挂的」。
+- **可移植性缺陷有确定归因**：host 通过而交叉目标失败时 `auto_decision` 直接判 `fix_code`，并写明「可移植性：字长 / 字节序 / 对齐 / 整型宽度假设」，明令不得靠改测试判据绕过——判据来自需求侧，改判据等于把缺陷合法化。
+
+术语要分清：本项目的 target 指**目标架构**，`runner.target` 指**验证机地址**（`user@host:port`）。验证机是跑 qemu 的那台 x86 机器，目标机是被模拟的架构。
 
 ### 失败闭环与人工裁决
 
@@ -99,9 +125,26 @@ AI 生成的代码不能靠「看着像对的」验收。这一段的目标是�
 
 ## 交付件
 
-`services/report_service.py` 是装配逻辑的唯一出口，流水线 report 节点与导出接口共用同一份——否则前端看到的报告和导出的 docx 会各算一套结论，那是交付件里最不能出的错。报告本身不调 LLM、不重新判断，只把已落库的工具结论折叠成人能审、能归档的文档；元数据里没有的一律写「未产出」，绝不用推测补齐。
+最终交付形态是**软件工程包**，不是「一份结论」。`GET /api/projects/<id>/export/bundle`（前端「软件工程包」卡一键导出 ZIP；`format=dir` 只在服务器生成目录便于本地打开，`format=plan` 不落盘、只返回装配计划）。判据是：拿到包的人不访问本系统，也能回答「交付了哪些文件、每个文件是哪一版、结论由哪一轮执行支撑」。
 
-- **软件测评报告**（`GET /api/projects/<id>/export/report?format=docx|xlsx`）：GJB 438B 风格取够用口径，含测评结论、用例结果、覆盖率、静态违规、需求追溯摘要、问题报告单、偏差单、证据清单。结论保守——静态与执行任一判据缺失或不通过，都不得给出「通过」。
+```
+00_包清单/   包清单.md（七节：基线一致性核对 / 告警与未产出项 / 文档清单 / 源码基线 /
+             验证证据 / 复现方式 / 完整性校验）+ manifest.json（逐文件 sha256）
+01_文档/     各阶段 docx：需求规格 / 概设 / 详设 / 用例设计 / 静态检查报告 / 执行报告 / 测评报告
+02_源码基线/ include/ src/ tests/ + build.sh 与结果解析桩（验证机构件，角色单独标注）
+03_追溯/     需求追溯矩阵 xlsx（按基线版本钉死）
+04_证据/     每一轮执行的原始日志与解析结果；多目标时含逐目标 <目标id>.log
+```
+
+工程包的三条装配规矩（`exporters/bundle_exporter.py`，取数在 `services/bundle_service.py`，模块本身不读库因此可离线单测）：
+
+- **源码基线取「最后一次验证执行真正跑过的那一版」**，不取库里最新版。证据（用例结果、覆盖率、输入指纹）只对执行时那一版成立；执行之后又改过的代码是「未经证实的代码」，把它当基线交付等于把结论套到别的代码上。文档与追溯矩阵同样跟着基线版本走，保证「包里的文档描述包里的代码」。
+- **逐字节核对**：把基线工作区重算 sha256，与该轮执行证据里的输入指纹逐文件比对。对不上不拦导出，但在包清单里显式标出来（`一致 / 不一致 / 执行证据中无此文件 / 基线中缺此文件`）——交付件宁可难看，不可含糊。
+- **只折叠不新造**：文档、追溯件、证据全部取已落库产物重新装配，不调 LLM、不重算结论；未产出的阶段不写空文件占位，只在包清单里记「未产出」。没有代码产物就装配不出包，前端按钮直接不出现。
+
+包内的结论性交付件也可单独导出。`services/report_service.py` 是报告装配逻辑的唯一出口，流水线 report 节点与导出接口共用同一份——否则前端看到的报告和导出的 docx 会各算一套结论，那是交付件里最不能出的错。报告本身不调 LLM、不重新判断，只把已落库的工具结论折叠成人能审、能归档的文档；元数据里没有的一律写「未产出」，绝不用推测补齐。
+
+- **软件测评报告**（`GET /api/projects/<id>/export/report?format=docx|xlsx`）：GJB 438B 风格取够用口径，含测评结论、用例结果、覆盖率、静态违规、需求追溯摘要、问题报告单、偏差单、证据清单；多目标执行时另含「3.1.1 目标机矩阵」（每个目标的架构事实、编译器、执行方式、为什么要测它）与逐目标结论列，xlsx 附「目标机矩阵」表。结论保守——静态与执行任一判据缺失或不通过，都不得给出「通过」；多目标时结论取各目标最差值。
 - **需求追溯矩阵**（xlsx）：见上一节。
 - **问题报告单 / 偏差单**：闭环过程中失败过的每一轮都登记为问题报告单（含后来修好的，标注已闭环与责任方判定）；最终仍存在的必查项违规登记为偏差单，可偏差项须人工批准，不可偏差项只能整改。
 - **证据清单**：每条证据 = 路径 + 字节数 + sha256。sha256 必须与同步输入逐字节对得上，这是「报告所述代码 == 实际执行代码」的唯一凭据。
@@ -141,6 +184,9 @@ cp .env.example .env   # Windows 用 copy .env.example .env
 # Windows PowerShell: scripts\setup_verify_vm.ps1
 # 然后在 .env 填 VERIFY_HOST / VERIFY_USER / VERIFY_KEY / VERIFY_WORKDIR
 # 不配也能跑：流水线退化为「只静态检查、不实际执行」，执行结论标 skipped，不会假绿
+#    （可选）多目标机执行：在验证机上装交叉工具链 + qemu-user（幂等，装完自动冒烟）
+#    ssh -i ~/.ssh/id_ed25519_workbuddy_verify lixf@<验证机IP> 'bash -s' -- < scripts/setup_verify_targets.sh
+#    然后 .env 设 VERIFY_TARGETS=host,arm32,ppc32；不设则只测验证机本机（host）
 
 # 4. 启动
 # Windows: .venv\Scripts\python.exe app.py
@@ -197,6 +243,7 @@ APP_DEBUG=0        # 共享时务必关闭 debug
 | `VERIFY_WORKDIR` | `wb_verify` | 远端工作区根（相对 `$HOME`） |
 | `VERIFY_TIMEOUT` | `300` | 单次远端命令超时（秒） |
 | `VERIFY_LOCAL` | `0` | `=1` 忽略 `VERIFY_HOST`，用本机工具链（Linux/macOS 自测） |
+| `VERIFY_TARGETS` | `host` | 目标机列表（逗号分隔）：`host` / `arm32` / `arm64` / `ppc32`；多于一个时需先在验证机跑 `setup_verify_targets.sh`。写错 id 直接报错，不静默降级成只测宿主机 |
 | `COVERAGE_BRANCH_MIN` | `80` | 分支覆盖率门限，低于该值矩阵标红；`0` 表示不判 |
 | `COVERAGE_LINE_MIN` | `0` | 行覆盖率门限 |
 | `COMPLEXITY_MAX` | `10` | 圈复杂度上限（规则 `WB-C-006`） |
@@ -215,6 +262,8 @@ APP_DEBUG=0        # 共享时务必关闭 debug
 - **规则表单点**：编码子集规则由 `core/c_rules.py` 定义一次，代码生成提示词（`prompt_block`）与静态检查器（`core/c_static.py`）都从这张表导出，规则改了不会两边漂。检查实现用 pycparser（纯 Python C99 AST）+ 远端 gcc 编译兜底，不引 LLVM/clang-tidy；子集外的写法一律判违规，不做兼容处理。
 - **判据与证据分离**：`verification/` 四层各司一职（runner 送文件跑命令 / buildkit 生成固定命令序列 / parsers 只认工具真实打印的文本 / executor 出三维判定并归档），都不碰 DB 与 LLM；节点层负责落库与路由。未配置验证机时结论是 `skipped` 而不是 `ok`——离线能走，但假绿不行。
 - **归因分层**：能靠确定判据定责的（构建失败 / 覆盖率不足 / 设计实现不一致）由 `executor.auto_decision` 直接判死方向，只有「用例挂了但构建与覆盖率都正常」这类需要读代码权衡的情形才交归因智能体，且其结论照样落在人工评审门后面。
+- **多目标汇总**：目标表在 `verification/targets.py` 定义一次，构建脚本参数、工具链探测命令、报告里的选型说明都从它导出（`scripts/setup_verify_targets.sh` 里的四张表由 `tests/test_targets.py` 与 Python 侧逐目标交叉校验，漂移就红）。汇总只「取最差」不重新解释工具输出——判据只能有一个来源；工具链缺失记 `blocked` 转人工，绝不当成通过。
+- **工程包基线**：源码基线跟着「最后一次真实执行过的那一版」走而不是库里最新版，并与该轮证据的输入指纹逐字节核对；对不上标红但不拦导出。装配只折叠已落库产物，不调 LLM、不新造结论。
 
 ## 目录结构
 
@@ -228,15 +277,19 @@ core/               llm_client(OpenAI兼容) / mock_llm(离线演示) / json_uti
 parsing/            doc_parser / chunker / retriever(BM25) / extractor(map-reduce)
 agents/             base_agent(重试校验) / stage_agents(需求|概设|详设|用例|代码|测试实现|归因)
 pipeline/           state / nodes(解析+智能体+门控+3个工具节点+失败闭环路由) / graph(LangGraph 编排)
-verification/       runner(SSH/本机执行环境) / buildkit(构建脚本与测试桩) / parsers(工具输出解析)
-                    executor(执行编排：判定+指纹+证据归档)
+verification/       runner(SSH/本机执行环境) / targets(目标机矩阵与工具链探测)
+                    buildkit(构建脚本与测试桩) / parsers(工具输出解析)
+                    executor(执行编排：多目标判定+指纹+证据归档)
 services/           pipeline_service(后台线程执行/恢复) / trace_service(追溯矩阵取数)
                     report_service(测评报告装配，节点与导出共用)
-routes/             projects(项目/上传/启动/评审/日志/SSE流/追溯) / export(用例|文档|追溯矩阵|测评报告)
+                    bundle_service(软件工程包取数与装配计划)
+routes/             projects(项目/上传/启动/评审/日志/SSE流/追溯) / export(用例|文档|追溯矩阵|测评报告|工程包)
 exporters/          excel_exporter / docx_exporter / xmind_exporter / trace_exporter / report_exporter
+                    bundle_exporter(软件工程包：基线选择+指纹核对+折叠装配)
 templates/ static/  前端单页（marked + mermaid 本地化渲染；SSE 实时增量 + 变速轮询兜底）
 data/               app.sqlite / checkpoints.sqlite / uploads / outputs / logs / verify(执行证据)
 scripts/            make_sample_prd.py / make_comm_prd.py（示例 PRD）/ setup_verify_vm.ps1（验证机免密）
+                    setup_verify_targets.sh（验证机多目标工具链，幂等）
                     e2e_verify_vm.py（判据层验收）/ e2e_pipeline_mock.py（全链路三场景验收）
 tests/              零依赖测试脚本（run_all.py 一键全跑）
 ```
@@ -257,6 +310,7 @@ tests/              零依赖测试脚本（run_all.py 一键全跑）
 | GET | /api/projects/&lt;id&gt;/stages/&lt;stage&gt;/export?format=docx\|md | 导出阶段文档 |
 | GET | /api/projects/&lt;id&gt;/export/traceability?format=excel | 导出需求追溯矩阵 |
 | GET | /api/projects/&lt;id&gt;/export/report?format=docx\|xlsx | 导出软件测评报告（含问题单/偏差单/证据清单） |
+| GET | /api/projects/&lt;id&gt;/export/bundle?format=zip\|dir\|plan | 导出软件工程包（文档 + 源码基线 + 追溯件 + 逐轮验证证据 + 包清单）；`plan` 只返回装配计划 |
 | GET | /api/meta | 阶段定义与显示名（前端单一数据源） |
 
 stage 取值（按流水线真实顺序，`static` 夹在 `code` 与 `test_impl` 之间）：parse / requirement / hld / lld / testcase / code / static / test_impl / exec / report
@@ -282,27 +336,43 @@ stage 取值（按流水线真实顺序，`static` 夹在 `code` 与 `test_impl`
 | `test_extractor_ids.py` | 素材编号分配、分块来源标记（`D1C12`）与抽取缓存复用 |
 | `test_json_utils.py` | 代码围栏剥离、平衡括号修复等输出清洗 |
 | `test_c_static.py` | 规则表自洽性 + 每条规则的「命中」与「不误报」双向用例、设计覆盖、反馈渲染 |
-| `test_buildkit.py` | 构建脚本/编译探针/测试桩/工作区拼装；路径穿越防护、测试桩不可被生成物覆盖 |
-| `test_parsers.py` | build.sh 分段、用例结果行、gcov 文本解析（夹具取自验证机实跑原文） |
-| `test_executor.py` | 未配置验证机必须 skipped、三维判定互相独立、归因只在需要读代码时返回 None |
+| `test_buildkit.py` | 构建脚本/编译探针/测试桩/工作区拼装；路径穿越防护、测试桩不可被生成物覆盖；交叉目标的 `-static` 与 qemu 前缀 |
+| `test_targets.py` | 目标表解析（未知 id 必须抛错、不许静默降级成只测 host）、工具链探测（`unknown` 与 `missing` 区分）、目标表与安装脚本防漂移 |
+| `test_parsers.py` | build.sh 分段、用例结果行、gcov 文本解析（夹具取自验证机实跑原文）；逐目标覆盖率合并 |
+| `test_executor.py` | 未配置验证机必须 skipped、三维判定互相独立、归因只在需要读代码时返回 None；多目标取最差值、缺工具链记 blocked、可移植性缺陷归因 |
 | `test_mock_c.py` | 离线 C 样本过静态门零违规、产物往返抽取一致、归因结论结构 |
-| `test_report.py` | 结论保守、证据 sha256 可回溯、问题单/偏差单留痕、docx/xlsx 导出 |
+| `test_report.py` | 结论保守、证据 sha256 可回溯、问题单/偏差单留痕、docx/xlsx 导出；目标机矩阵与逐目标列、结论取最差 |
+| `test_bundle.py` | 软件工程包：基线选对（取最后一次真跑过的那一版）、sha256 逐字节核对得住、未产出不写空壳、多目标证据规划与旧产物兼容 |
 | `test_pipeline_loop.py` | 失败闭环图级路由：额度保留/恢复、超限→人工门、代码侧修复跳过测试门、路由表 ⊆ 图节点 |
 
 每条规则都要有「命中」与「不误报」两个方向的用例：只测命中会把检查器越写越激进，而误报在流水线里表现为一条永远修不好的假失败，比漏报更难查——生成智能体每次都被要求去改一段本来正确的代码。
 
 ### 端到端验收（连真实验证机）
 
-单测不连验证机、不调模型；下面两个脚本才验「真跑起来对不对」，都不碰 `data/app.sqlite` 里的真实项目：
+单测不连验证机、不调模型；下面两个脚本才验「真跑起来对不对」，都不碰 `data/app.sqlite` 里的真实项目（判据层脚本用独立项目号 9999 与独立工作区）：
 
 ```powershell
-# 判据层：静态检查 / 编译 / 用例 / 覆盖率这些确定性结论对不对
-.venv\Scripts\python.exe scripts\e2e_verify_vm.py
+# 判据层：静态检查 / 编译 / 用例 / 覆盖率 / 多目标 这些确定性结论对不对
+.venv\Scripts\python.exe scripts\e2e_verify_vm.py                        # 目标机取 .env 的 VERIFY_TARGETS
+.venv\Scripts\python.exe scripts\e2e_verify_vm.py host,arm32,ppc32       # 显式指定目标机（含大端）
 
 # 编排层：整张图跑通 + 失败闭环，三个场景（可只跑其中一个）
 .venv\Scripts\python.exe scripts\e2e_pipeline_mock.py            # green + defect + overlimit
 .venv\Scripts\python.exe scripts\e2e_pipeline_mock.py defect     # 只验缺陷闭环
 ```
+
+`e2e_verify_vm.py` 六步，全部结论来自确定性工具输出，任一步不达标即退出码非 0：
+
+| 步骤 | 验什么 |
+|---|---|
+| 1 探测 | 验证机可达且 gcc / gcov / make / tar 在位，打印 uname 与核数 |
+| 2 绿跑 | comm 样例模块在验证机本机：code 与 test_impl 两道编译探针 + 完整验证（19 条用例全过、分支覆盖率 100%） |
+| 3 缺陷注入 | CRC 初值改错 → 必须检出用例失败，且「构建 ok / 覆盖 ok」时 `auto_decision` 返回 None 交归因智能体（工具链判不死方向就不武断判） |
+| 4 交付件 | 真实静态报告 + 真实执行结论 → 装配测评报告 → 导出 docx/xlsx 并确认真的能打开 |
+| 5 多目标 | 同一份源码在 host / arm32 / ppc32 上分别交叉编译 + qemu 执行 + 采覆盖率：编译器指纹与目标表一致、逐目标独立工作区、逐目标 `<目标id>.log` 落盘、报告出目标机矩阵（少于 2 个目标时打印 SKIP，不算通过也不算失败） |
+| 6 跨架构缺陷 | 注入一处「隐含小端假设」的 CRC 写字节序 → host / arm32 照过、ppc32 挂 2 条，归因必须判 `fix_code` 且写明「可移植性（字节序）」，不许改测试判据绕过 |
+
+第 2～4 步始终在验证机本机跑，用来钉住单目标时代的证据布局一字不变；第 5～6 步才动多目标，需要先跑过 `scripts/setup_verify_targets.sh`。第 6 步注入的写法是「先手工翻转字节序，再按本机字节序整字写入」——小端目标上落盘字节恰好正确，大端目标上两个字节反了，正是星载软件里最典型的「宿主机测不出来」。
 
 `e2e_pipeline_mock.py` 用 `LLM_MOCK=1` 把模型换成 `core/mock_c.py` 的固定产物（可重复、零 token、无需 Web UI），判据层仍打真实验证机：
 
@@ -312,4 +382,4 @@ stage 取值（按流水线真实顺序，`static` 夹在 `code` 与 `test_impl`
 | `defect` | 注入一处代码缺陷（金卡 95 折算成 90 折，只有 TC-006 判据对不上）：exec 失败 → 归因智能体定责代码缺陷 → 回代码阶段重生 → 再过代码评审门 → 转绿；失败那轮在问题报告单里留痕并标注已闭环 |
 | `overlimit` | 每轮都生成同一份坏代码：数满 `MAX_FIX_ROUNDS` 轮后出问题报告单、停在人工裁决门；受理后仍装配交付件，但测评结论必须是「不通过」 |
 
-缺陷之所以选「改坏一个常量表达式」：编译照过、静态照过、分支结构不变（覆盖率不动），纯粹是判据对不上，正好落在「确定性判据不足以定责、必须读代码与用例」的归因智能体分支上，也是航天软件里最典型的「实现与设计常量不一致」。
+编排层的缺陷之所以选「改坏一个常量表达式」：编译照过、静态照过、分支结构不变（覆盖率不动），纯粹是判据对不上，正好落在「确定性判据不足以定责、必须读代码与用例」的归因智能体分支上，也是航天软件里最典型的「实现与设计常量不一致」。

@@ -12,6 +12,8 @@ AI 生成的代码里。这三件事由本模块生成固定模板，AI 只负�
 """
 from __future__ import annotations
 
+from verification import targets as tgt_tab
+
 # 编译选项固定：C99 + 全告警 + 不优化（优化会让 gcov 的行/分支归属失真）
 CFLAGS = "-std=c99 -Wall -Wextra -g -O0 -fprofile-arcs -ftest-coverage"
 INCLUDES = "-Iinclude -Isrc -Itests"
@@ -31,8 +33,10 @@ sec() { printf 'WB_SECTION %s\n' "$1"; }
 sec env
 printf 'uname=%s\n' "$(uname -srm 2>/dev/null)"
 printf 'cores=%s\n' "$(nproc 2>/dev/null || echo 1)"
-printf 'gcc=%s\n' "$(gcc --version 2>/dev/null | head -1)"
-printf 'gcov=%s\n' "$(gcov --version 2>/dev/null | head -1)"
+printf 'target=%s\n' "__TARGET__"
+printf 'qemu=%s\n' "__QEMU__"
+printf 'gcc=%s\n' "$(__CC__ --version 2>/dev/null | head -1)"
+printf 'gcov=%s\n' "$(__GCOV__ --version 2>/dev/null | head -1)"
 printf 'date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf 'cwd=%s\n' "$(pwd)"
 printf 'cflags=%s\n' "__CFLAGS__"
@@ -57,14 +61,14 @@ sec build
 status=0
 for f in $SRCS; do
     obj="build/$(printf '%s' "$f" | tr '/' '_' | sed 's/\.c$/.o/')"
-    gcc __CFLAGS__ __INCLUDES__ -c "$f" -o "$obj" 2>&1 || status=1
+    __CC__ __CFLAGS__ __INCLUDES__ -c "$f" -o "$obj" 2>&1 || status=1
 done
 if [ "$status" -ne 0 ]; then
     printf 'WB_BUILD_RESULT fail\n'
     sec end
     exit 2
 fi
-gcc __CFLAGS__ __INCLUDES__ build/*.o -o build/wb_tests -lm 2>&1 || status=1
+__CC__ __CFLAGS__ __INCLUDES__ build/*.o -o build/wb_tests -lm 2>&1 || status=1
 if [ "$status" -ne 0 ]; then
     printf 'WB_BUILD_RESULT fail\n'
     sec end
@@ -73,7 +77,7 @@ fi
 printf 'WB_BUILD_RESULT ok\n'
 
 sec run
-./build/wb_tests
+__RUN__./build/wb_tests
 printf 'WB_RUN_EXIT %d\n' $?
 
 sec coverage
@@ -85,7 +89,7 @@ for f in src/*.c; do
     g="build/$(printf '%s' "$f" | tr '/' '_' | sed 's/\.c$/.gcda/')"
     [ -e "$g" ] || continue
     printf 'WB_GCOV_TARGET %s\n' "$f"
-    gcov -b -c -f "$g" 2>&1
+    __GCOV__ -b -c -f "$g" 2>&1
 done
 rm -f ./*.gcov
 
@@ -192,11 +196,6 @@ int wb_summary(void)
 HARNESS_FILES = {"tests/wb_harness.h": HARNESS_H, "tests/wb_harness.c": HARNESS_C}
 
 
-def build_script() -> str:
-    return (BUILD_SH.replace("__CFLAGS__", CFLAGS)
-                    .replace("__INCLUDES__", INCLUDES))
-
-
 # 编译探针：只做「能不能编译/能不能链接」这一件事，不运行、不采覆盖率。
 # 代码与测试实现两个阶段的硬校验器用它——AI 说写完了不算，工具链说能编才算。
 CHECK_SH = r"""#!/bin/sh
@@ -220,7 +219,7 @@ fi
 status=0
 for f in $SRCS; do
     obj="build/$(printf '%s' "$f" | tr '/' '_' | sed 's/\.c$/.o/')"
-    gcc __CFLAGS_NO_COV__ __INCLUDES__ -c "$f" -o "$obj" 2>&1 || status=1
+    __CC__ __CFLAGS_NO_COV__ __INCLUDES__ -c "$f" -o "$obj" 2>&1 || status=1
 done
 if [ "$status" -ne 0 ]; then
     printf 'WB_BUILD_RESULT fail\n'
@@ -231,7 +230,7 @@ printf 'WB_BUILD_RESULT ok\n'
 exit 0
 """
 
-_LINK_BLOCK = """gcc __CFLAGS_NO_COV__ __INCLUDES__ build/*.o -o build/wb_tests -lm 2>&1 || {
+_LINK_BLOCK = """__CC__ __CFLAGS_NO_COV__ __INCLUDES__ build/*.o -o build/wb_tests -lm 2>&1 || {
     printf 'WB_BUILD_RESULT link_fail\\n'
     exit 2
 }"""
@@ -240,23 +239,52 @@ _LINK_BLOCK = """gcc __CFLAGS_NO_COV__ __INCLUDES__ build/*.o -o build/wb_tests 
 CFLAGS_NO_COV = "-std=c99 -Wall -Wextra -g -O0"
 
 
-def check_script(link: bool = False) -> str:
+def cflags_for(tgt=None) -> str:
+    """本轮编译选项 = 固定基线 + 目标附加项（交叉目标要 -static）。"""
+    extra = str((tgt.extra_cflags if tgt is not None else "") or "").strip()
+    return f"{CFLAGS} {extra}".strip()
+
+
+def cflags_no_cov_for(tgt=None) -> str:
+    extra = str((tgt.extra_cflags if tgt is not None else "") or "").strip()
+    return f"{CFLAGS_NO_COV} {extra}".strip()
+
+
+def _apply_target(text: str, tgt=None) -> str:
+    """把目标表里的工具名注入脚本模板。
+
+    tgt 为 None 时按 host 处理，保证既有调用方与既有证据格式一字不变。"""
+    tgt = tgt or tgt_tab.by_id("host")
+    return (text.replace("__CC__", tgt.cc)
+                .replace("__GCOV__", tgt.gcov)
+                .replace("__RUN__", tgt.run_prefix)
+                .replace("__QEMU__", tgt.qemu or "none")
+                .replace("__TARGET__", tgt.id))
+
+
+def build_script(tgt=None) -> str:
+    return _apply_target(BUILD_SH.replace("__CFLAGS__", cflags_for(tgt))
+                                 .replace("__INCLUDES__", INCLUDES), tgt)
+
+
+def check_script(link: bool = False, tgt=None) -> str:
     # 注意替换顺序：链接块自身也含编译选项占位符，必须先把块内的占位符换掉，
     # 再塞进主脚本，否则会把 __CFLAGS_NO_COV__ 原样交给 gcc。
-    block = (_LINK_BLOCK.replace("__CFLAGS_NO_COV__", CFLAGS_NO_COV)
+    flags = cflags_no_cov_for(tgt)
+    block = (_LINK_BLOCK.replace("__CFLAGS_NO_COV__", flags)
                         .replace("__INCLUDES__", INCLUDES) if link else "")
-    return (CHECK_SH.replace("__LINK_BLOCK__", block)
-                    .replace("__CFLAGS_NO_COV__", CFLAGS_NO_COV)
-                    .replace("__INCLUDES__", INCLUDES))
+    return _apply_target(CHECK_SH.replace("__LINK_BLOCK__", block)
+                                 .replace("__CFLAGS_NO_COV__", flags)
+                                 .replace("__INCLUDES__", INCLUDES), tgt)
 
 
 def workspace_files(code_files: dict | None = None,
-                    test_files: dict | None = None) -> dict:
+                    test_files: dict | None = None, tgt=None) -> dict:
     """拼出要同步到验证机的完整工作区：被测代码 + 测试 + 桩 + 构建脚本。
 
     路径一律规范化成正斜杠相对路径，并按目录约定过滤——把模型可能写出的
     绝对路径、`./`、反斜杠挡在同步之前，否则 tar 解包会落到工作区外面。"""
-    out = {"build.sh": build_script()}
+    out = {"build.sh": build_script(tgt)}
     for files in (code_files, test_files):
         for rel, content in (files or {}).items():
             path = normalize_path(rel)
